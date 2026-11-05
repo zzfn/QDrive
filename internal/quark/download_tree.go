@@ -8,7 +8,9 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
+	"sync"
 	"unicode"
 	"unicode/utf8"
 )
@@ -20,14 +22,15 @@ import (
 //     server returns before it is ever turned into a local path;
 //  2. fetch: create directories one level at a time with os.Mkdir (never
 //     MkdirAll), re-checking with Lstat that every component below the root
-//     is a real directory, then download files one at a time through the same
-//     resumable, never-overwriting path as DownloadFile.
+//     is a real directory, then download files through the same resumable,
+//     never-overwriting path as DownloadFile.
 //
-// Nothing local is ever deleted or replaced. A rerun stops on any existing
-// final file rather than assuming equal size proves equal content.
+// Nothing local is ever deleted or replaced. Existing final files are
+// reported as conflicts rather than assumed to match the remote content.
 const (
-	treeMaxItems = 100000
-	treeMaxDepth = 64
+	treeMaxItems        = 100000
+	treeMaxDepth        = 64
+	maxDirectoryWorkers = 16
 )
 
 var (
@@ -41,18 +44,22 @@ var (
 	ErrUnsafeLocalPath = errors.New("quark: unsafe local path")
 )
 
-// DirDownloadError describes where a directory download stopped. Completed
-// lists files (slash-separated, relative to the root) finished in this call;
-// Failed is the file or directory being handled when Err occurred. Partial
-// data is kept. A rerun stops at any already completed local file.
+// DirDownloadError reports the first failure, how many items failed and how
+// many files did not start. Completed contains files completed during this
+// call, relative to the root. Existing files are never assumed to match.
 type DirDownloadError struct {
-	Completed []string
-	Failed    string
-	Err       error
+	Completed   []string
+	Failed      string
+	FailedCount int
+	NotStarted  int
+	Err         error
 }
 
 func (e *DirDownloadError) Error() string {
-	return fmt.Sprintf("quark: download dir: %d file(s) completed, stopped at %q: %v", len(e.Completed), e.Failed, e.Err)
+	if e.Failed == "" {
+		return fmt.Sprintf("quark: download dir: %d file(s) completed, %d item(s) failed, %d file(s) not started: %v", len(e.Completed), e.FailedCount, e.NotStarted, e.Err)
+	}
+	return fmt.Sprintf("quark: download dir: %d file(s) completed, %d item(s) failed, %d file(s) not started; first failure at %q: %v", len(e.Completed), e.FailedCount, e.NotStarted, e.Failed, e.Err)
 }
 
 func (e *DirDownloadError) Unwrap() error { return e.Err }
@@ -62,18 +69,23 @@ type treeItem struct {
 	rel string // slash-separated, relative to the download root
 }
 
-// DownloadDir downloads the remote directory remotePath into localPath,
-// which is the destination directory itself (its contents mirror the remote
-// directory's contents). localPath must either not exist, in which case it is
-// created (its parent must already exist), or be an existing real directory
-// (not a symlink). Files are fetched one at a time.
-//
-// An existing local file is never overwritten or assumed to match the remote
-// content: any existing file stops the download with ErrLocalExists.
-//
-// progress (may be nil) receives the slash-separated relative path of the
-// current file with its bytes held and total size.
+// DownloadDir downloads files one at a time. See DownloadDirWorkers for
+// directory and conflict handling.
 func (c *Client) DownloadDir(ctx context.Context, remotePath, localPath string, progress func(path string, done, total int64)) error {
+	return c.DownloadDirWorkers(ctx, remotePath, localPath, 1, progress)
+}
+
+// DownloadDirWorkers downloads a remote directory using up to workers (1-16)
+// file downloads at once. The destination is the directory itself; its parent
+// must already exist. Existing files are not overwritten or counted as done:
+// they are reported as failures while other files can continue. Other errors
+// stop new downloads and cancel those in flight. Individual partial downloads
+// are retained and may be resumed on a later invocation. Progress callbacks
+// are serialized across workers and must return quickly.
+func (c *Client) DownloadDirWorkers(ctx context.Context, remotePath, localPath string, workers int, progress func(path string, done, total int64)) error {
+	if workers < 1 || workers > maxDirectoryWorkers {
+		return fmt.Errorf("quark: directory download workers must be between 1 and %d", maxDirectoryWorkers)
+	}
 	if strings.TrimSpace(localPath) == "" {
 		return errors.New("quark: empty local path")
 	}
@@ -96,37 +108,128 @@ func (c *Client) DownloadDir(ctx context.Context, remotePath, localPath string, 
 		return err
 	}
 
-	var done []string
-	fail := func(rel string, err error) error {
-		return &DirDownloadError{Completed: done, Failed: rel, Err: err}
+	var files []treeItem
+	for _, it := range items {
+		if !it.f.IsDir {
+			files = append(files, it)
+		}
 	}
 	for _, it := range items {
 		if err := ctx.Err(); err != nil {
-			return fail(it.rel, err)
+			return &DirDownloadError{NotStarted: len(files), Err: err}
 		}
-		local, err := localUnder(root, it.rel)
-		if err != nil {
-			return fail(it.rel, err)
-		}
-		if it.f.IsDir {
-			if err := makeDirOnce(local); err != nil {
-				return fail(it.rel, err)
-			}
+		if !it.f.IsDir {
 			continue
 		}
-		var cb func(int64, int64)
-		if progress != nil {
-			rel := it.rel
-			cb = func(d, t int64) { progress(rel, d, t) }
+		local, err := localUnder(root, it.rel)
+		if err == nil {
+			err = makeDirOnce(local)
 		}
-		p, err := newDownloadPaths(local)
 		if err != nil {
-			return fail(it.rel, err)
+			return &DirDownloadError{Failed: it.rel, FailedCount: 1, NotStarted: len(files), Err: err}
 		}
-		if err := c.downloadResolved(ctx, it.f, joinPath(remotePath, it.rel), p, cb); err != nil {
-			return fail(it.rel, err)
+	}
+	if len(files) == 0 {
+		return nil
+	}
+
+	type result struct {
+		rel        string
+		err        error
+		notStarted bool
+	}
+	workCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	jobs := make(chan treeItem)
+	results := make(chan result, workers)
+	var wg sync.WaitGroup
+	var progressMu sync.Mutex
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for it := range jobs {
+				if err := workCtx.Err(); err != nil {
+					results <- result{rel: it.rel, err: err, notStarted: true}
+					continue
+				}
+				local, err := localUnder(root, it.rel)
+				if err == nil {
+					var paths downloadPaths
+					paths, err = newDownloadPaths(local)
+					if err == nil {
+						var cb func(int64, int64)
+						if progress != nil {
+							rel := it.rel
+							cb = func(done, total int64) {
+								progressMu.Lock()
+								defer progressMu.Unlock()
+								progress(rel, done, total)
+							}
+						}
+						err = c.downloadResolved(workCtx, it.f, joinPath(remotePath, it.rel), paths, cb)
+					}
+				}
+				results <- result{rel: it.rel, err: err}
+				if err != nil && !errors.Is(err, ErrLocalExists) {
+					cancel()
+				}
+			}
+		}()
+	}
+	go func() {
+		defer close(jobs)
+		for _, it := range files {
+			if workCtx.Err() != nil {
+				return
+			}
+			select {
+			case <-workCtx.Done():
+				return
+			case jobs <- it:
+			}
 		}
-		done = append(done, it.rel)
+	}()
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	var completed []string
+	var first *DirDownloadError
+	for r := range results {
+		if r.notStarted {
+			continue
+		}
+		if r.err == nil {
+			completed = append(completed, r.rel)
+		} else if first == nil {
+			first = &DirDownloadError{Failed: r.rel, FailedCount: 1, Err: r.err}
+		} else {
+			first.FailedCount++
+			// A conflict is expected on reruns; don't let it hide a separate
+			// network, filesystem or cancellation failure.
+			if errors.Is(first.Err, ErrLocalExists) && !errors.Is(r.err, ErrLocalExists) {
+				first.Failed, first.Err = r.rel, r.err
+			}
+		}
+	}
+	failed := 0
+	if first != nil {
+		failed = first.FailedCount
+	}
+	notStarted := len(files) - len(completed) - failed
+	if ctx.Err() != nil && notStarted > 0 && (first == nil || errors.Is(first.Err, ErrLocalExists)) {
+		if first == nil {
+			first = &DirDownloadError{}
+		}
+		first.Failed, first.Err = "", ctx.Err()
+	}
+	if first != nil {
+		sort.Strings(completed)
+		first.Completed = completed
+		first.NotStarted = notStarted
+		return first
 	}
 	return nil
 }

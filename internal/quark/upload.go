@@ -4,11 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
-	"crypto/sha1"
 	"encoding"
 	"encoding/base64"
 	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,7 +26,8 @@ import (
 //
 //  1. POST upload/pre      -> task_id, bucket, obj_key, upload_id, upload_url,
 //     auth_info, callback; metadata.part_size
-//  2. for each part, in order:
+//  2. for each part (read and hashed in order, PUT with bounded
+//     concurrency from metadata.part_thread; see upload_parallel.go):
 //     POST upload/auth   (signs an OSS string-to-sign) -> auth_key
 //     PUT  OSS ?partNumber=N&uploadId=..  (X-Oss-Hash-Ctx for N>=2) -> ETag
 //  3. POST update/hash     (whole-file md5+sha1) -> finish (already stored)
@@ -36,11 +35,12 @@ import (
 //  5. POST upload/finish
 //
 // Part PUTs are retried on transient transport errors (upload_retry.go);
-// no other step is retried.
+// no other step is retried. Failures of steps 3-5 that may have reached the
+// server are reported as ErrUnconfirmed (see unconfirmedCommit).
 //
-// Only a fresh, sequential, single-file upload into an existing directory is
-// implemented (optionally reporting per-part progress). Resume, parallel
-// parts, directory creation and overwrite are not; see UploadProgress.
+// Only a fresh single-file upload into an existing directory is implemented
+// (optionally reporting progress). Resume, directory creation and overwrite
+// are not; see UploadProgress.
 const (
 	uploadPrePath    = "/1/clouddrive/file/upload/pre"
 	uploadHashPath   = "/1/clouddrive/file/update/hash"
@@ -73,44 +73,61 @@ type uploadSession struct {
 	AuthInfo  json.RawMessage `json:"auth_info"`
 	Callback  json.RawMessage `json:"callback"`
 
-	partSize int64
-	callback string   // base64 of compact callback JSON object
-	ossBase  *url.URL // https://bucket.host/objkey (escaped)
+	partSize   int64
+	partThread int      // server-suggested part concurrency, clamped, >= 1
+	callback   string   // base64 of compact callback JSON object
+	ossBase    *url.URL // https://bucket.host/objkey (escaped)
 }
 
 // Upload uploads the regular file at localPath into the existing remote
-// directory remoteDir, keeping the local base name. It never overwrites.
+// directory remoteDir, keeping the local base name. It refuses an existing
+// same-name entry observed before upload. Concurrent remote writes may race
+// this check; the server's collision behavior has not been verified.
 func (c *Client) Upload(ctx context.Context, localPath string, remoteDir string) error {
 	return c.UploadProgress(ctx, localPath, remoteDir, nil)
 }
 
 // UploadProgress is Upload with an optional progress callback. If progress
-// is non-nil it is called synchronously from the uploading goroutine with
-// (0, total) once the upload session is created, and then after each part
-// has been accepted by OSS with the cumulative byte count of accepted parts.
+// is non-nil it is called synchronously, never concurrently, from the
+// goroutine that called UploadProgress with (0, total) once the upload
+// session is created, and then after each part has been accepted by OSS
+// with the non-decreasing cumulative byte count of accepted parts (parts
+// may complete out of order).
 // done == total means every part is stored, not that the file is committed;
 // the upload is complete only when UploadProgress returns nil. The callback
 // must not block for long and must not call back into the Client.
 //
 // Uploads are not resumable: an interrupted upload restarts from scratch on
-// the next call.
+// the next call. If the commit phase fails in a way that leaves the remote
+// state unknown, the error wraps ErrUnconfirmed; check the remote directory
+// before retrying.
 func (c *Client) UploadProgress(ctx context.Context, localPath string, remoteDir string, progress func(done, total int64)) error {
-	report := func(done, total int64) {
-		if progress != nil {
-			progress(done, total)
-		}
-	}
 	f, err := os.Open(localPath)
 	if err != nil {
 		return fmt.Errorf("quark: upload: %w", err)
 	}
 	defer f.Close()
+	return c.uploadOpened(ctx, f, localPath, remoteDir, "", nil, progress)
+}
+
+// uploadOpened uses an already-open handle. Directory uploads pass the
+// planned identity and resolved destination ID, avoiding a second open or
+// path-based destination resolution after their checks.
+func (c *Client) uploadOpened(ctx context.Context, f *os.File, localPath, remoteDir, dirID string, expected os.FileInfo, progress func(done, total int64)) error {
+	report := func(done, total int64) {
+		if progress != nil {
+			progress(done, total)
+		}
+	}
 	st, err := f.Stat()
 	if err != nil {
 		return fmt.Errorf("quark: upload: %w", err)
 	}
 	if !st.Mode().IsRegular() {
 		return fmt.Errorf("%w: not a regular file: %s", ErrUnsupported, localPath)
+	}
+	if expected != nil && !sameLocal(st, expected) {
+		return fmt.Errorf("%w: %s", ErrFileChanged, localPath)
 	}
 	size := st.Size()
 	if size == 0 {
@@ -121,14 +138,17 @@ func (c *Client) UploadProgress(ctx context.Context, localPath string, remoteDir
 		return fmt.Errorf("quark: upload: invalid file name %q", name)
 	}
 
-	dir, err := c.resolve(ctx, remoteDir)
-	if err != nil {
-		return err
+	if dirID == "" {
+		dir, err := c.resolve(ctx, remoteDir)
+		if err != nil {
+			return err
+		}
+		if !dir.IsDir {
+			return fmt.Errorf("%w: %s", ErrNotDir, remoteDir)
+		}
+		dirID = dir.ID
 	}
-	if !dir.IsDir {
-		return fmt.Errorf("%w: %s", ErrNotDir, remoteDir)
-	}
-	entries, err := c.listDir(ctx, dir.ID)
+	entries, err := c.listDir(ctx, dirID)
 	if err != nil {
 		return err
 	}
@@ -143,72 +163,51 @@ func (c *Client) UploadProgress(ctx context.Context, localPath string, remoteDir
 		mimeType = "application/octet-stream"
 	}
 
-	s, err := c.uploadPre(ctx, name, mimeType, size, dir.ID)
+	s, err := c.uploadPre(ctx, name, mimeType, size, dirID)
 	if err != nil {
 		return err
 	}
-	if n := (size + s.partSize - 1) / s.partSize; n > maxParts {
+	if n := 1 + (size-1)/s.partSize; n > maxParts {
 		return fmt.Errorf("%w: %d parts exceeds %d", ErrUnsupported, n, maxParts)
 	}
 
-	md5h, sha1h := md5.New(), sha1.New()
-	chain := sha1.New() // state before current part, for X-Oss-Hash-Ctx
-	buf := make([]byte, min(s.partSize, size))
 	report(0, size)
-	var etags []string
-	var done int64
-	for part := 1; done < size; part++ {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		n := min(s.partSize, size-done)
-		chunk := buf[:n]
-		if _, err := io.ReadFull(f, chunk); err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				return ErrFileChanged
-			}
-			return fmt.Errorf("quark: upload: read: %w", err)
-		}
-		var hctx string
-		if part >= 2 {
-			if hctx, err = sha1Ctx(chain); err != nil {
-				return err
-			}
-		}
-		etag, err := c.uploadPartRetry(ctx, s, mimeType, part, chunk, hctx)
-		if err != nil {
-			return err
-		}
-		etags = append(etags, etag)
-		md5h.Write(chunk)
-		sha1h.Write(chunk)
-		chain.Write(chunk)
-		done += n
-		report(done, size)
-	}
-	// The file must not have grown or been replaced while reading.
-	if extra, _ := f.Read(make([]byte, 1)); extra != 0 {
-		return ErrFileChanged
-	}
-	if st2, err := f.Stat(); err != nil || st2.Size() != size || !st2.ModTime().Equal(st.ModTime()) {
-		return ErrFileChanged
-	}
-
-	finished, err := c.uploadHash(ctx, s, hex.EncodeToString(md5h.Sum(nil)), hex.EncodeToString(sha1h.Sum(nil)))
+	parts, err := c.uploadParts(ctx, f, st, s, mimeType, size, progress)
 	if err != nil {
 		return err
 	}
+
+	// Commit phase: from here on a request may change remote state.
+	if err := ctx.Err(); err != nil {
+		return err // nothing commit-related sent yet
+	}
+	finished, err := c.uploadHash(ctx, s, parts.md5hex, parts.sha1hex)
+	if err != nil {
+		return unconfirmedCommit(ctx, "upload hash", err)
+	}
 	if !finished {
-		if err := c.uploadComplete(ctx, s, etags); err != nil {
-			return err
+		if err := c.uploadComplete(ctx, s, parts.etags); err != nil {
+			return err // already classified
 		}
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return fmt.Errorf("%w: upload finish not sent: %v", ErrUnconfirmed, err)
 	}
 	var out json.RawMessage
 	body, _ := json.Marshal(map[string]string{"obj_key": s.ObjKey, "task_id": s.TaskID})
-	return c.call(ctx, "upload finish", http.MethodPost, uploadFinishPath, nil, body, &out)
+	if err := c.call(ctx, "upload finish", http.MethodPost, uploadFinishPath, nil, body, &out); err != nil {
+		return unconfirmedCommit(ctx, "upload finish", err)
+	}
+	// A successful finish response alone does not establish that the file is
+	// visible under the expected name. This check cannot prove content identity
+	// or guard against concurrent remote writers.
+	return c.verify(ctx, "upload finish", func() (bool, error) {
+		matches, err := c.children(ctx, dirID, name)
+		if err != nil {
+			return false, err
+		}
+		return len(matches) == 1 && !matches[0].IsDir && matches[0].Size == size, nil
+	})
 }
 
 func (c *Client) uploadPre(ctx context.Context, name, mimeType string, size int64, pdir string) (*uploadSession, error) {
@@ -232,7 +231,8 @@ func (c *Client) uploadPre(ctx context.Context, name, mimeType string, size int6
 		Message  string `json:"message"`
 		Data     *uploadSession
 		Metadata struct {
-			PartSize json.Number `json:"part_size"`
+			PartSize   json.Number `json:"part_size"`
+			PartThread json.Number `json:"part_thread"`
 		} `json:"metadata"`
 	}
 	if err := c.postJSONFull(ctx, "upload pre", uploadPrePath, body, &resp); err != nil {
@@ -255,6 +255,7 @@ func (c *Client) uploadPre(ctx context.Context, name, mimeType string, size int6
 		return nil, fmt.Errorf("%w: part_size %d", ErrUnsupported, ps)
 	}
 	s.partSize = ps
+	s.partThread = parsePartThread(resp.Metadata.PartThread.String())
 	if s.TaskID == "" || s.UploadID == "" || len(s.AuthInfo) == 0 || string(s.AuthInfo) == "null" {
 		return nil, errors.New("quark: upload pre: incomplete session")
 	}
@@ -500,7 +501,8 @@ func (c *Client) uploadComplete(ctx context.Context, s *uploadSession, etags []s
 		contentMD5, date, callback, date, ossUserAgent, s.Bucket, s.ObjKey, s.UploadID)
 	key, err := c.ossAuth(ctx, s, meta)
 	if err != nil {
-		return err
+		// The complete request was not sent, but update/hash already was.
+		return unconfirmedCommit(ctx, "upload commit auth", err)
 	}
 	u := *s.ossBase
 	u.RawQuery = url.Values{"uploadId": {s.UploadID}}.Encode()
@@ -517,11 +519,15 @@ func (c *Client) uploadComplete(ctx context.Context, s *uploadSession, etags []s
 	req.Header.Set("x-oss-user-agent", ossUserAgent)
 	resp, err := c.ossDo(req)
 	if err != nil {
-		return fmt.Errorf("quark: upload commit: %w", err)
+		if errors.Is(err, ErrUntrustedURL) {
+			return fmt.Errorf("%w: upload commit not sent: %v", ErrUnconfirmed, err)
+		}
+		return unconfirmedCommit(ctx, "upload commit", fmt.Errorf("quark: upload commit: %w", err))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return httpErr("upload commit", resp)
+		// 203 CallbackFailed: object assembled, callback outcome unknown.
+		return unconfirmedCommit(ctx, "upload commit", httpErr("upload commit", resp))
 	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxJSONBytes))
 	return nil

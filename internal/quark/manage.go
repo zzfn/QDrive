@@ -104,11 +104,16 @@ func (c *Client) Mkdir(ctx context.Context, remotePath string) (File, error) {
 	if err != nil {
 		return File{}, err
 	}
-	if err := c.ensureAbsent(ctx, parent.ID, name, joinPath(parentPath, name)); err != nil {
+	return c.mkdirIn(ctx, parent.ID, parentPath, name)
+}
+
+// mkdirIn uses an already resolved parent ID. Callers validate the name.
+func (c *Client) mkdirIn(ctx context.Context, parentID, parentPath, name string) (File, error) {
+	if err := c.ensureAbsent(ctx, parentID, name, joinPath(parentPath, name)); err != nil {
 		return File{}, err
 	}
 	body, _ := json.Marshal(map[string]any{
-		"pdir_fid":      parent.ID,
+		"pdir_fid":      parentID,
 		"file_name":     name,
 		"dir_path":      "",
 		"dir_init_lock": false,
@@ -117,8 +122,8 @@ func (c *Client) Mkdir(ctx context.Context, remotePath string) (File, error) {
 		return File{}, err
 	}
 	var out File
-	err = c.verify(ctx, "mkdir", func() (bool, error) {
-		m, err := c.children(ctx, parent.ID, name)
+	err := c.verify(ctx, "mkdir", func() (bool, error) {
+		m, err := c.children(ctx, parentID, name)
 		if err != nil || len(m) != 1 || !m[0].IsDir {
 			return false, err
 		}

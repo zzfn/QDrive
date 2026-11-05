@@ -434,32 +434,55 @@ func runCommand(ctx context.Context, args []string, in io.Reader, out, errOut io
 		return map[string]any{"share_id": args[2]}, nil
 	case "upload":
 		if len(args) < 2 || len(args) > 3 {
-			return nil, withCode("USAGE", errors.New("用法: qdrive upload <本地文件> [网盘目录]"))
+			return nil, withCode("USAGE", errors.New("用法: qdrive upload <本地路径> [网盘目录]"))
 		}
 		remote := "/"
 		if len(args) == 3 {
 			remote = args[2]
 		}
+		info, err := os.Lstat(args[1])
+		if err != nil {
+			return nil, withCode("UPLOAD_FAILED", fmt.Errorf("本地路径: %w", err))
+		}
 		client, err := newClient()
 		if err != nil {
 			return nil, err
 		}
-		var progress func(int64, int64)
-		if !jsonMode {
-			progress = progressPrinter(errOut, "上传")
+		if info.IsDir() {
+			var progress func(string, int64, int64)
+			if !jsonMode {
+				var last time.Time
+				progress = func(name string, done, total int64) {
+					now := time.Now()
+					if done != total && !last.IsZero() && now.Sub(last) < time.Second {
+						return
+					}
+					last = now
+					fmt.Fprintf(errOut, "上传 %s: %d / %d 字节\n", displayName(name), done, total)
+				}
+			}
+			err = client.UploadDir(ctx, args[1], remote, progress)
+		} else {
+			var progress func(int64, int64)
+			if !jsonMode {
+				progress = progressPrinter(errOut, "上传")
+			}
+			err = client.UploadProgress(ctx, args[1], remote, progress)
 		}
-		if err := client.UploadProgress(ctx, args[1], remote, progress); err != nil {
-			return nil, withCode("UPLOAD_FAILED", fmt.Errorf("上传失败: %w", err))
+		if err != nil {
+			return nil, manageError("UPLOAD_FAILED", fmt.Errorf("上传失败: %w", err))
 		}
-		fmt.Fprintln(out, "已上传:", args[1])
-		return map[string]any{"local": args[1], "remote_dir": remote}, nil
+		fmt.Fprintln(out, "已上传:", displayName(args[1]))
+		return map[string]any{"local": args[1], "remote_dir": remote, "is_dir": info.IsDir()}, nil
 	case "download":
-		if len(args) < 2 || len(args) > 3 {
-			return nil, withCode("USAGE", errors.New("用法: qdrive download <网盘文件> [本地文件]"))
+		positional, workers, workersSet, err := parseDownloadArgs(args[1:])
+		if err != nil {
+			return nil, withCode("USAGE", err)
 		}
-		local := path.Base(args[1])
-		if len(args) == 3 {
-			local = args[2]
+		remotePath := positional[0]
+		local := path.Base(remotePath)
+		if len(positional) == 2 {
+			local = positional[1]
 		}
 		if local == "." || local == "/" || local == "" || filepath.Base(local) == "." {
 			return nil, withCode("USAGE", errors.New("无效的本地文件名"))
@@ -473,13 +496,16 @@ func runCommand(ctx context.Context, args []string, in io.Reader, out, errOut io
 		if err != nil {
 			return nil, err
 		}
-		remote, err := client.Stat(ctx, args[1])
+		remote, err := client.Stat(ctx, remotePath)
 		if err != nil {
 			return nil, withCode("DOWNLOAD_FAILED", err)
 		}
 		var progress func(int64, int64)
 		if !jsonMode {
 			progress = progressPrinter(errOut, "下载")
+		}
+		if !remote.IsDir && workersSet {
+			return nil, withCode("USAGE", errors.New("--workers 仅适用于目录下载"))
 		}
 		if remote.IsDir {
 			var dirProgress func(string, int64, int64)
@@ -494,9 +520,9 @@ func runCommand(ctx context.Context, args []string, in io.Reader, out, errOut io
 					fmt.Fprintf(errOut, "下载 %s: %d / %d 字节\n", displayName(name), done, total)
 				}
 			}
-			err = client.DownloadDir(ctx, args[1], local, dirProgress)
+			err = client.DownloadDirWorkers(ctx, remotePath, local, workers, dirProgress)
 		} else {
-			err = client.DownloadFileProgress(ctx, args[1], local, progress)
+			err = client.DownloadFileProgress(ctx, remotePath, local, progress)
 		}
 		if err != nil {
 			code := "DOWNLOAD_FAILED"
@@ -506,10 +532,51 @@ func runCommand(ctx context.Context, args []string, in io.Reader, out, errOut io
 			return nil, withCode(code, fmt.Errorf("下载失败: %w", err))
 		}
 		fmt.Fprintln(out, "已下载:", local)
-		return map[string]any{"remote": args[1], "local": local, "is_dir": remote.IsDir}, nil
+		return map[string]any{"remote": remotePath, "local": local, "is_dir": remote.IsDir}, nil
 	default:
 		return nil, fmt.Errorf("未知命令: %s", args[0])
 	}
+}
+
+// parseDownloadArgs accepts the same bounded directory-worker option used by
+// the reference CLI. It does not affect a single-file download.
+func parseDownloadArgs(args []string) ([]string, int, bool, error) {
+	workers := 4
+	var positional []string
+	var workersSet, endOptions bool
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if !endOptions && arg == "--" {
+			endOptions = true
+			continue
+		}
+		if endOptions || (arg != "--workers" && !strings.HasPrefix(arg, "--workers=")) {
+			positional = append(positional, arg)
+			continue
+		}
+		if workersSet {
+			return nil, 0, false, errors.New("--workers 只能指定一次")
+		}
+		var value string
+		if arg == "--workers" {
+			if i+1 >= len(args) {
+				return nil, 0, false, errors.New("--workers 需要一个 1 至 16 的整数")
+			}
+			i++
+			value = args[i]
+		} else {
+			value = strings.TrimPrefix(arg, "--workers=")
+		}
+		n, err := strconv.Atoi(value)
+		if err != nil || n < 1 || n > 16 {
+			return nil, 0, false, errors.New("--workers 必须是 1 至 16 的整数")
+		}
+		workers, workersSet = n, true
+	}
+	if len(positional) < 1 || len(positional) > 2 {
+		return nil, 0, false, errors.New("用法: qdrive download <网盘路径> [本地路径] [--workers 1-16]")
+	}
+	return positional, workers, workersSet, nil
 }
 
 // progressPrinter reports byte counts on stderr without flooding redirected logs.
@@ -564,8 +631,8 @@ func usage(out io.Writer) {
 	fmt.Fprintln(out, "  qdrive move <网盘路径> <目标目录>   移动")
 	fmt.Fprintln(out, "  qdrive copy <网盘路径> <目标目录>   复制")
 	fmt.Fprintln(out, "  qdrive delete --yes [--recursive] <网盘路径>  删除")
-	fmt.Fprintln(out, "  qdrive upload <本地文件> [网盘目录]  上传单个文件")
-	fmt.Fprintln(out, "  qdrive download <网盘路径> [本地路径]  下载文件或目录")
+	fmt.Fprintln(out, "  qdrive upload <本地路径> [网盘目录]  上传文件或目录")
+	fmt.Fprintln(out, "  qdrive download <网盘路径> [本地路径] [--workers 1-16]  下载文件或目录")
 	fmt.Fprintln(out, "  qdrive share <网盘路径> <天数> <true|false>  创建分享")
 	fmt.Fprintln(out, "  qdrive share-list                   查看分享")
 	fmt.Fprintln(out, "  qdrive share-save --yes <链接> [提取码|--passcode-stdin] [目标目录]  转存分享")

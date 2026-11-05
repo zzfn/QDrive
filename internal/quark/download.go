@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Resumable download state lives beside the final file:
@@ -23,11 +24,13 @@ import (
 // The partial is only ever extended when the metadata matches the current
 // remote file ID and size; anything doubtful is reported, never deleted.
 const (
-	partSuffix   = ".qdrive-part"
-	metaSuffix   = ".qdrive-meta"
-	lockSuffix   = ".qdrive-lock"
-	metaVersion  = 1
-	copyBufBytes = 256 << 10
+	partSuffix         = ".qdrive-part"
+	metaSuffix         = ".qdrive-meta"
+	lockSuffix         = ".qdrive-lock"
+	metaVersion        = 1
+	copyBufBytes       = 256 << 10
+	downloadMaxRetries = 3
+	downloadRetryDelay = time.Second
 )
 
 var (
@@ -44,12 +47,13 @@ var (
 )
 
 type downloadMeta struct {
-	Version int    `json:"version"`
-	FID     string `json:"fid"`
-	Size    int64  `json:"size"`
-	Remote  string `json:"remote"`
-	Target  string `json:"target"`
-	ETag    string `json:"etag,omitempty"` // strong validator only
+	Version          int    `json:"version"`
+	FID              string `json:"fid"`
+	Size             int64  `json:"size"`
+	Remote           string `json:"remote"`
+	Target           string `json:"target"`
+	ETag             string `json:"etag,omitempty"` // strong validator only
+	ResponseComplete bool   `json:"response_complete,omitempty"`
 }
 
 func (m downloadMeta) sameContent(o downloadMeta) bool {
@@ -136,15 +140,43 @@ func (c *Client) downloadResolved(ctx context.Context, f File, remotePath string
 		return err
 	}
 
+	if f.Size > 0 && ((offset == f.Size && !meta.ResponseComplete) || (offset < f.Size && meta.ResponseComplete)) {
+		return fmt.Errorf("%w: partial size and completed response marker disagree; inspect and move both partial and metadata aside before retrying (data kept)", ErrPartialMismatch)
+	}
 	if progress != nil {
 		progress(offset, f.Size)
 	}
-	if offset < f.Size {
-		if err := c.fetchRange(ctx, f, p, offset, &meta, progress); err != nil {
+	for attempt := 0; offset < f.Size; attempt++ {
+		err := c.fetchRange(ctx, f, p, offset, &meta, progress)
+		if err == nil {
+			meta.ResponseComplete = true
+			if err := writeMeta(p.meta, meta); err != nil {
+				return err
+			}
+			break
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if attempt >= downloadMaxRetries || !isTransientNetErr(err) {
+			return err
+		}
+		// Keep the per-file lock while rechecking the partial and its metadata.
+		meta, offset, err = loadOrInitState(p, want)
+		if err != nil {
+			return err
+		}
+		if offset == f.Size && !meta.ResponseComplete {
+			return fmt.Errorf("%w: response ended ambiguously after all bytes were written; inspect and move both partial and metadata aside before retrying (data kept)", ErrPartialMismatch)
+		}
+		if offset > 0 && meta.ETag == "" {
+			return fmt.Errorf("%w: no strong ETag for the partial file; refusing an unsafe resume", ErrRangeUnsupported)
+		}
+		if err := sleepCtx(ctx, downloadRetryDelay<<attempt); err != nil {
 			return err
 		}
 	}
-	return finalize(p, f.Size)
+	return finalize(p, f.Size, meta)
 }
 
 func checkAbsent(name string) error {
@@ -173,7 +205,7 @@ func acquireLock(name string) (func(), error) {
 // in the partial file. It refuses to adopt a partial without matching
 // metadata and never deletes user data.
 func loadOrInitState(p downloadPaths, want downloadMeta) (downloadMeta, int64, error) {
-	raw, merr := os.ReadFile(p.meta)
+	raw, _, merr := readDownloadMeta(p.meta)
 	pfi, perr := os.Lstat(p.part)
 	if perr != nil && !errors.Is(perr, os.ErrNotExist) {
 		return want, 0, fmt.Errorf("quark: stat partial: %w", perr)
@@ -188,7 +220,7 @@ func loadOrInitState(p downloadPaths, want downloadMeta) (downloadMeta, int64, e
 			return want, 0, fmt.Errorf("%w: %s has no metadata", ErrPartialMismatch, p.part)
 		}
 		// Fresh start: metadata first, then an exclusively created partial.
-		if err := writeMeta(p.meta, want); err != nil {
+		if err := createDownloadMeta(p.meta, want); err != nil {
 			return want, 0, err
 		}
 		pf, err := os.OpenFile(p.part, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
@@ -198,6 +230,7 @@ func loadOrInitState(p downloadPaths, want downloadMeta) (downloadMeta, int64, e
 		if err := pf.Close(); err != nil {
 			return want, 0, fmt.Errorf("quark: create partial: %w", err)
 		}
+		syncDir(filepath.Dir(p.part))
 		return want, 0, nil
 	case merr != nil:
 		return want, 0, fmt.Errorf("quark: read partial metadata: %w", merr)
@@ -212,13 +245,20 @@ func loadOrInitState(p downloadPaths, want downloadMeta) (downloadMeta, int64, e
 			ErrPartialMismatch, p.part, got.FID, got.Size, want.FID, want.Size)
 	}
 	want.ETag = got.ETag
+	want.ResponseComplete = got.ResponseComplete
 	if perr != nil {
+		if want.ResponseComplete {
+			return want, 0, fmt.Errorf("%w: completed response has no partial file", ErrPartialMismatch)
+		}
 		// Metadata without data (e.g. crash between the two writes).
 		pf, err := os.OpenFile(p.part, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 		if err != nil {
 			return want, 0, fmt.Errorf("quark: create partial: %w", err)
 		}
-		_ = pf.Close()
+		if err := pf.Close(); err != nil {
+			return want, 0, fmt.Errorf("quark: create partial: %w", err)
+		}
+		syncDir(filepath.Dir(p.part))
 		return want, 0, nil
 	}
 	if pfi.Size() > want.Size {
@@ -227,7 +267,79 @@ func loadOrInitState(p downloadPaths, want downloadMeta) (downloadMeta, int64, e
 	return want, pfi.Size(), nil
 }
 
+// readDownloadMeta refuses symbolic links and changes between Lstat and Open.
+// The bounded read prevents an unrelated large file from being loaded as state.
+func readDownloadMeta(name string) ([]byte, os.FileInfo, error) {
+	before, err := os.Lstat(name)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !before.Mode().IsRegular() {
+		return nil, nil, fmt.Errorf("%w: metadata is not a regular file: %s", ErrPartialMismatch, name)
+	}
+	f, err := os.Open(name)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer f.Close()
+	after, err := f.Stat()
+	if err != nil || !after.Mode().IsRegular() || !os.SameFile(before, after) {
+		return nil, nil, fmt.Errorf("%w: metadata changed while opening", ErrPartialMismatch)
+	}
+	b, err := io.ReadAll(io.LimitReader(f, maxJSONBytes+1))
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(b) > maxJSONBytes {
+		return nil, nil, fmt.Errorf("%w: metadata is too large", ErrPartialMismatch)
+	}
+	return b, after, nil
+}
+
+// createDownloadMeta publishes complete metadata without replacing a file
+// that appeared after the initial check, using the same link strategy as the
+// final download. The temporary file is always created exclusively.
+func createDownloadMeta(name string, m downloadMeta) error {
+	b, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(filepath.Dir(name), filepath.Base(name)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("quark: create metadata: %w", err)
+	}
+	tmpName := f.Name()
+	defer os.Remove(tmpName)
+	if _, err := f.Write(b); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("quark: create metadata: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("quark: sync metadata: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("quark: close metadata: %w", err)
+	}
+	if err := os.Link(tmpName, name); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("%w: metadata appeared during creation: %s", ErrPartialMismatch, name)
+		}
+		return fmt.Errorf("quark: publish metadata: %w", err)
+	}
+	syncDir(filepath.Dir(name))
+	return nil
+}
+
 func writeMeta(name string, m downloadMeta) error {
+	raw, before, err := readDownloadMeta(name)
+	if err != nil {
+		return fmt.Errorf("quark: read metadata before update: %w", err)
+	}
+	var old downloadMeta
+	if err := json.Unmarshal(raw, &old); err != nil || !old.sameContent(m) {
+		return fmt.Errorf("%w: metadata changed before update", ErrPartialMismatch)
+	}
 	b, err := json.Marshal(m)
 	if err != nil {
 		return err
@@ -249,9 +361,14 @@ func writeMeta(name string, m downloadMeta) error {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("quark: write metadata: %w", err)
 	}
+	current, err := os.Lstat(name)
+	if err != nil || !current.Mode().IsRegular() || !os.SameFile(before, current) {
+		return fmt.Errorf("%w: metadata changed before replace", ErrPartialMismatch)
+	}
 	if err := os.Rename(tmpName, name); err != nil {
 		return fmt.Errorf("quark: write metadata: %w", err)
 	}
+	syncDir(filepath.Dir(name))
 	return nil
 }
 
@@ -294,6 +411,9 @@ func (c *Client) fetchRange(ctx context.Context, f File, p downloadPaths, offset
 			return fmt.Errorf("quark: download: content-length %d, remote size %d", resp.ContentLength, f.Size)
 		}
 	case offset > 0 && resp.StatusCode == http.StatusPartialContent:
+		if etag := strings.TrimSpace(resp.Header.Get("ETag")); etag != "" && etag != meta.ETag {
+			return fmt.Errorf("%w: response validator changed; partial kept", ErrPartialMismatch)
+		}
 		if err := checkContentRange(resp.Header.Get("Content-Range"), offset, f.Size); err != nil {
 			return err
 		}
@@ -386,6 +506,10 @@ func checkContentRange(v string, offset, size int64) error {
 // appendBody writes at most n bytes of body at offset. Every byte written is
 // a correct prefix extension, so on error/cancel the partial stays usable.
 func appendBody(part string, offset, n int64, body io.Reader, onWrite func(held int64)) (err error) {
+	before, err := os.Lstat(part)
+	if err != nil || !before.Mode().IsRegular() {
+		return fmt.Errorf("%w: partial is missing or not a regular file", ErrPartialMismatch)
+	}
 	pf, err := os.OpenFile(part, os.O_WRONLY, 0)
 	if err != nil {
 		return fmt.Errorf("quark: open partial: %w", err)
@@ -399,7 +523,7 @@ func appendBody(part string, offset, n int64, body io.Reader, onWrite func(held 
 		}
 	}()
 	fi, err := pf.Stat()
-	if err != nil || !fi.Mode().IsRegular() || fi.Size() != offset {
+	if err != nil || !fi.Mode().IsRegular() || !os.SameFile(before, fi) || fi.Size() != offset {
 		return fmt.Errorf("%w: partial changed during download", ErrPartialMismatch)
 	}
 	if _, err := pf.Seek(offset, io.SeekStart); err != nil {
@@ -424,15 +548,19 @@ func appendBody(part string, offset, n int64, body io.Reader, onWrite func(held 
 		return fmt.Errorf("quark: download: %w (partial kept at %d bytes)", scrub(err), offset+w)
 	}
 	if w != n {
-		return fmt.Errorf("quark: download: short body %d/%d (partial kept)", offset+w, offset+n)
+		return fmt.Errorf("quark: download: short body %d/%d (partial kept): %w", offset+w, offset+n, io.ErrUnexpectedEOF)
 	}
 	return nil
 }
 
 // finalize verifies the partial size and publishes it under the target name
 // without ever replacing an existing file (hard link fails on EEXIST).
-func finalize(p downloadPaths, size int64) error {
+func finalize(p downloadPaths, size int64, meta downloadMeta) error {
 	// Windows requires a writable handle for Sync (FlushFileBuffers).
+	before, err := os.Lstat(p.part)
+	if err != nil || !before.Mode().IsRegular() {
+		return fmt.Errorf("%w: partial is missing or not a regular file", ErrPartialMismatch)
+	}
 	pf, err := os.OpenFile(p.part, os.O_RDWR, 0)
 	if err != nil {
 		return fmt.Errorf("quark: open partial: %w", err)
@@ -445,8 +573,12 @@ func finalize(p downloadPaths, size int64) error {
 	if err != nil {
 		return fmt.Errorf("quark: verify partial: %w", err)
 	}
-	if !fi.Mode().IsRegular() || fi.Size() != size {
-		return fmt.Errorf("quark: download: size mismatch %d/%d (partial kept)", fi.Size(), size)
+	if !fi.Mode().IsRegular() || !os.SameFile(before, fi) || fi.Size() != size {
+		return fmt.Errorf("%w: partial changed or size mismatch %d/%d (partial kept)", ErrPartialMismatch, fi.Size(), size)
+	}
+	current, err := os.Lstat(p.part)
+	if err != nil || !current.Mode().IsRegular() || !os.SameFile(fi, current) {
+		return fmt.Errorf("%w: partial changed before install", ErrPartialMismatch)
 	}
 	if err := os.Link(p.part, p.target); err != nil {
 		if errors.Is(err, os.ErrExist) {
@@ -454,10 +586,25 @@ func finalize(p downloadPaths, size int64) error {
 		}
 		return fmt.Errorf("quark: install %s (partial kept at %s): %w", p.target, p.part, err)
 	}
+	linked, err := os.Lstat(p.target)
+	if err != nil || !linked.Mode().IsRegular() || !os.SameFile(fi, linked) || linked.Size() != size {
+		return fmt.Errorf("%w: installed target changed; target and partial kept for inspection", ErrPartialMismatch)
+	}
 	syncDir(filepath.Dir(p.target))
-	// The target is complete; cleanup failures are harmless leftovers.
-	_ = os.Remove(p.part)
-	_ = os.Remove(p.meta)
+	// Only clean up the identities we just validated. Unexpected files are
+	// preserved for inspection rather than treated as our own leftovers.
+	if current, err := os.Lstat(p.part); err == nil && current.Mode().IsRegular() && os.SameFile(fi, current) {
+		_ = os.Remove(p.part)
+	}
+	if raw, original, err := readDownloadMeta(p.meta); err == nil {
+		var got downloadMeta
+		if json.Unmarshal(raw, &got) == nil && got.sameContent(meta) && got.ETag == meta.ETag && got.ResponseComplete == meta.ResponseComplete {
+			if current, err := os.Lstat(p.meta); err == nil && current.Mode().IsRegular() && os.SameFile(original, current) {
+				_ = os.Remove(p.meta)
+			}
+		}
+	}
+	syncDir(filepath.Dir(p.target))
 	return nil
 }
 
