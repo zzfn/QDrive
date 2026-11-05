@@ -1,0 +1,494 @@
+package quark
+
+import (
+	"bytes"
+	"context"
+	"crypto/md5"
+	"crypto/sha1"
+	"crypto/tls"
+	"encoding"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// upMock is a fake Quark API + OSS endpoint. All hosts are routed to one
+// local TLS server, so the production host checks (isQuarkURL) stay active.
+type upMock struct {
+	t *testing.T
+
+	mu    sync.Mutex
+	steps []string
+	parts map[int][]byte
+	ctxs  map[int]string
+	metas []string
+
+	uploadURL  string
+	bucket     string
+	partSize   any
+	callback   any
+	rapid      bool
+	existing   []entry
+	fail       map[string]int // step -> http status (or 0 = api error)
+	blockPart  int            // block this part until the request is canceled
+	partReady  chan struct{}
+	commitBody []byte
+	hashBody   map[string]string
+	finishBody map[string]string
+	ossCookie  bool
+}
+
+const testBucket = "ul-bucket"
+
+func newUpMock(t *testing.T) *upMock {
+	return &upMock{t: t, parts: map[int][]byte{}, ctxs: map[int]string{}, fail: map[string]int{},
+		uploadURL: "http://pds.quark.cn", bucket: testBucket, partSize: 64,
+		callback: map[string]any{"callbackUrl": "https://x.quark.cn/cb", "callbackBody": "a=${x}"}}
+}
+
+func (m *upMock) step(s string) {
+	m.mu.Lock()
+	m.steps = append(m.steps, s)
+	m.mu.Unlock()
+}
+
+func (m *upMock) Steps() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return strings.Join(m.steps, ",")
+}
+
+func (m *upMock) failed(w http.ResponseWriter, s string) bool {
+	code, ok := m.fail[s]
+	if !ok {
+		return false
+	}
+	if code == 0 {
+		writeJSON(w, 200, map[string]any{"status": 400, "code": 999, "message": "boom", "data": nil})
+	} else {
+		w.WriteHeader(code)
+		io.WriteString(w, "<Error>denied</Error>")
+	}
+	return true
+}
+
+func (m *upMock) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	host := r.Host
+	if host == "drive-pc.quark.cn" {
+		if r.Header.Get("Cookie") != testCookie {
+			m.t.Errorf("api %s without cookie", r.URL.Path)
+		}
+		m.api(w, r)
+		return
+	}
+	if r.Header.Get("Cookie") != "" {
+		m.ossCookie = true
+	}
+	if host != testBucket+".pds.quark.cn" {
+		m.t.Errorf("unexpected host %q", host)
+		w.WriteHeader(404)
+		return
+	}
+	m.oss(w, r)
+}
+
+func (m *upMock) api(w http.ResponseWriter, r *http.Request) {
+	var body map[string]any
+	if r.Method == http.MethodPost {
+		json.NewDecoder(r.Body).Decode(&body)
+	}
+	ok := func(data any) { writeJSON(w, 200, map[string]any{"status": 200, "code": 0, "data": data}) }
+	switch r.URL.Path {
+	case listPath:
+		m.step("list")
+		list := []map[string]any{}
+		if r.URL.Query().Get("pdir_fid") == rootID {
+			list = append(list, map[string]any{"fid": "d1", "file_name": "docs", "dir": true})
+		} else {
+			for _, e := range m.existing {
+				list = append(list, map[string]any{"fid": e.fid, "file_name": e.name, "dir": e.dir})
+			}
+		}
+		ok(map[string]any{"list": list})
+	case uploadPrePath:
+		m.step("pre")
+		if body["pdir_fid"] != "d1" || body["file_name"] != "a.bin" || body["size"] != float64(150) ||
+			body["format_type"] != "application/octet-stream" {
+			m.t.Errorf("bad pre body %v", body)
+		}
+		if m.failed(w, "pre") {
+			return
+		}
+		writeJSON(w, 200, map[string]any{"status": 200, "code": 0,
+			"data": map[string]any{"task_id": "T1", "bucket": m.bucket, "obj_key": "ul/obj 1",
+				"upload_id": "U1", "upload_url": m.uploadURL, "auth_info": "AI", "callback": m.callback},
+			"metadata": map[string]any{"part_size": m.partSize, "part_thread": 3}})
+	case uploadAuthPath:
+		m.step("auth")
+		if body["task_id"] != "T1" || body["auth_info"] != "AI" {
+			m.t.Errorf("bad auth body %v", body)
+		}
+		m.mu.Lock()
+		m.metas = append(m.metas, body["auth_meta"].(string))
+		m.mu.Unlock()
+		if m.failed(w, "auth") {
+			return
+		}
+		ok(map[string]any{"auth_key": "OSS key:" + strconv.Itoa(len(m.metas))})
+	case uploadHashPath:
+		m.step("hash")
+		m.hashBody = map[string]string{}
+		for k, v := range body {
+			m.hashBody[k], _ = v.(string)
+		}
+		if m.failed(w, "hash") {
+			return
+		}
+		ok(map[string]any{"finish": m.rapid})
+	case uploadFinishPath:
+		m.step("finish")
+		m.finishBody = map[string]string{}
+		for k, v := range body {
+			m.finishBody[k], _ = v.(string)
+		}
+		if m.failed(w, "finish") {
+			return
+		}
+		ok(map[string]any{"fid": "F1"})
+	default:
+		m.t.Errorf("unexpected api %s", r.URL.Path)
+		w.WriteHeader(404)
+	}
+}
+
+func (m *upMock) oss(w http.ResponseWriter, r *http.Request) {
+	if r.URL.EscapedPath() != "/ul/obj%201" || r.URL.Query().Get("uploadId") != "U1" {
+		m.t.Errorf("bad oss url %s", r.URL)
+	}
+	if r.Header.Get("x-oss-user-agent") != ossUserAgent || r.Header.Get("x-oss-date") == "" ||
+		!strings.HasPrefix(r.Header.Get("Authorization"), "OSS key:") {
+		m.t.Errorf("bad oss headers %v", r.Header)
+	}
+	body, _ := io.ReadAll(r.Body)
+	switch r.Method {
+	case http.MethodPut:
+		n, _ := strconv.Atoi(r.URL.Query().Get("partNumber"))
+		m.step("put" + strconv.Itoa(n))
+		if n == m.blockPart {
+			if m.partReady != nil {
+				close(m.partReady)
+			}
+			<-r.Context().Done()
+			return
+		}
+		if m.failed(w, "put"+strconv.Itoa(n)) {
+			return
+		}
+		m.mu.Lock()
+		m.parts[n] = body
+		m.ctxs[n] = r.Header.Get("X-Oss-Hash-Ctx")
+		m.mu.Unlock()
+		if m.fail["noetag"] == 0 {
+			w.Header().Set("ETag", `"E`+strconv.Itoa(n)+`"`)
+		}
+	case http.MethodPost:
+		m.step("commit")
+		m.commitBody = body
+		sum := md5.Sum(body)
+		if r.Header.Get("Content-MD5") != base64.StdEncoding.EncodeToString(sum[:]) ||
+			r.Header.Get("Content-Type") != "application/xml" || r.Header.Get("x-oss-callback") == "" {
+			m.t.Errorf("bad commit headers %v", r.Header)
+		}
+		if m.failed(w, "commit") {
+			return
+		}
+		io.WriteString(w, "<CompleteMultipartUploadResult/>")
+	}
+}
+
+func newUpClient(t *testing.T, m *upMock) *Client {
+	srv := httptest.NewTLSServer(m)
+	t.Cleanup(srv.Close)
+	addr := srv.Listener.Addr().String()
+	c := New(testCookie)
+	c.hc.Transport = &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, addr)
+		},
+	}
+	return c // baseURL and trust policy are the production ones
+}
+
+func testFile(t *testing.T) (string, []byte) {
+	data := make([]byte, 150)
+	for i := range data {
+		data[i] = byte(i*7 + 3)
+	}
+	p := filepath.Join(t.TempDir(), "a.bin")
+	if err := os.WriteFile(p, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p, data
+}
+
+func TestUploadSuccess(t *testing.T) {
+	m := newUpMock(t)
+	c := newUpClient(t, m)
+	p, data := testFile(t)
+	if err := c.Upload(context.Background(), p, "/docs"); err != nil {
+		t.Fatal(err)
+	}
+	want := "list,list,pre,auth,put1,auth,put2,auth,put3,hash,auth,commit,finish"
+	if got := m.Steps(); got != want {
+		t.Fatalf("steps\n got %s\nwant %s", got, want)
+	}
+	if m.ossCookie {
+		t.Fatal("cookie sent to OSS")
+	}
+	if !bytes.Equal(bytes.Join([][]byte{m.parts[1], m.parts[2], m.parts[3]}, nil), data) || len(m.parts[1]) != 64 {
+		t.Fatal("part bodies mismatch")
+	}
+	md5sum, sha1sum := md5.Sum(data), sha1.Sum(data)
+	if m.hashBody["md5"] != hex.EncodeToString(md5sum[:]) || m.hashBody["sha1"] != hex.EncodeToString(sha1sum[:]) || m.hashBody["task_id"] != "T1" {
+		t.Fatalf("hash body %v", m.hashBody)
+	}
+	if m.finishBody["obj_key"] != "ul/obj 1" || m.finishBody["task_id"] != "T1" {
+		t.Fatalf("finish body %v", m.finishBody)
+	}
+	wantXML := `<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"E1"</ETag></Part><Part><PartNumber>2</PartNumber><ETag>"E2"</ETag></Part><Part><PartNumber>3</PartNumber><ETag>"E3"</ETag></Part></CompleteMultipartUpload>`
+	if string(m.commitBody) != wantXML {
+		t.Fatalf("commit body %s", m.commitBody)
+	}
+	// Signed metadata mirrors the actual requests.
+	if !strings.HasPrefix(m.metas[0], "PUT\n\napplication/octet-stream\n") || strings.Contains(m.metas[0], "X-Oss-Hash-Ctx") ||
+		!strings.HasSuffix(m.metas[0], "\n/"+testBucket+"/ul/obj 1?partNumber=1&uploadId=U1") {
+		t.Fatalf("meta1 %q", m.metas[0])
+	}
+	if !strings.Contains(m.metas[1], "X-Oss-Hash-Ctx:"+m.ctxs[2]+"\n") || !strings.HasSuffix(m.metas[1], "?partNumber=2&uploadId=U1") {
+		t.Fatalf("meta2 %q", m.metas[1])
+	}
+	if !strings.HasPrefix(m.metas[3], "POST\n") || !strings.Contains(m.metas[3], "\napplication/xml\n") ||
+		!strings.HasSuffix(m.metas[3], "/"+testBucket+"/ul/obj 1?uploadId=U1") {
+		t.Fatalf("commit meta %q", m.metas[3])
+	}
+	// Each hash ctx must be the SHA-1 state over all previous parts.
+	if m.ctxs[1] != "" {
+		t.Fatal("part 1 must not carry hash ctx")
+	}
+	for n, prefix := range map[int]int{2: 64, 3: 128} {
+		checkHashCtx(t, m.ctxs[n], data, prefix)
+	}
+}
+
+// checkHashCtx resumes SHA-1 from the transmitted state and verifies it
+// yields the digest of the whole file.
+func checkHashCtx(t *testing.T, enc string, data []byte, prefix int) {
+	t.Helper()
+	raw, err := base64.StdEncoding.DecodeString(enc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v map[string]string
+	if err := json.Unmarshal(raw, &v); err != nil {
+		t.Fatal(err)
+	}
+	if v["hash_type"] != "sha1" || v["Nh"] != "0" || v["Nl"] != strconv.Itoa(prefix*8) || v["data"] != "" || v["num"] != "0" {
+		t.Fatalf("ctx %v", v)
+	}
+	st := make([]byte, 0, 96)
+	st = append(st, "sha\x01"...)
+	for _, k := range []string{"h0", "h1", "h2", "h3", "h4"} {
+		n, err := strconv.ParseUint(v[k], 10, 32)
+		if err != nil {
+			t.Fatal(err)
+		}
+		st = binary.BigEndian.AppendUint32(st, uint32(n))
+	}
+	st = append(st, make([]byte, 64)...)
+	st = binary.BigEndian.AppendUint64(st, uint64(prefix))
+	h := sha1.New()
+	if err := h.(encoding.BinaryUnmarshaler).UnmarshalBinary(st); err != nil {
+		t.Fatal(err)
+	}
+	h.Write(data[prefix:])
+	want := sha1.Sum(data)
+	if !bytes.Equal(h.Sum(nil), want[:]) {
+		t.Fatalf("hash ctx at %d does not chain", prefix)
+	}
+}
+
+func TestUploadRapidSkipsCommit(t *testing.T) {
+	m := newUpMock(t)
+	m.rapid = true
+	p, _ := testFile(t)
+	if err := newUpClient(t, m).Upload(context.Background(), p, "/docs"); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Steps(); strings.Contains(got, "commit") || !strings.HasSuffix(got, "hash,finish") {
+		t.Fatalf("steps %s", got)
+	}
+}
+
+func TestUploadErrorsNeverFinish(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(m *upMock)
+		last  string // last step expected to have happened
+		is    error
+	}{
+		{"pre api error", func(m *upMock) { m.fail["pre"] = 0 }, "pre", nil},
+		{"auth error", func(m *upMock) { m.fail["auth"] = 0 }, "auth", nil},
+		{"part http error", func(m *upMock) { m.fail["put2"] = 500 }, "put2", nil},
+		{"missing etag", func(m *upMock) { m.fail["noetag"] = 1 }, "put1", nil},
+		{"hash error", func(m *upMock) { m.fail["hash"] = 0 }, "hash", nil},
+		{"commit error", func(m *upMock) { m.fail["commit"] = 403 }, "commit", nil},
+		{"oss redirect not followed", func(m *upMock) { m.fail["put1"] = 307 }, "put1", nil},
+		{"untrusted upload host", func(m *upMock) { m.uploadURL = "https://evil.example.com" }, "pre", ErrUntrustedURL},
+		{"ip upload host", func(m *upMock) { m.uploadURL = "169.254.169.254" }, "pre", ErrUntrustedURL},
+		{"upload url with port", func(m *upMock) { m.uploadURL = "https://pds.quark.cn:8443" }, "pre", ErrUntrustedURL},
+		{"upload url userinfo", func(m *upMock) { m.uploadURL = "https://a@pds.quark.cn" }, "pre", ErrUntrustedURL},
+		{"bad scheme", func(m *upMock) { m.uploadURL = "ftp://pds.quark.cn" }, "pre", ErrUntrustedURL},
+		{"bucket injection", func(m *upMock) { m.bucket = "evil.com/x" }, "pre", ErrUntrustedURL},
+		{"unaligned part size", func(m *upMock) { m.partSize = 100 }, "pre", ErrUnsupported},
+		{"missing part size", func(m *upMock) { m.partSize = 0 }, "pre", nil},
+		{"string callback", func(m *upMock) { m.callback = "cb" }, "pre", ErrUnsupported},
+		{"name exists", func(m *upMock) { m.existing = []entry{{fid: "x", name: "a.bin"}} }, "list", ErrExists},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newUpMock(t)
+			tc.setup(m)
+			p, _ := testFile(t)
+			err := newUpClient(t, m).Upload(context.Background(), p, "/docs")
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if tc.is != nil && !errors.Is(err, tc.is) {
+				t.Fatalf("want %v, got %v", tc.is, err)
+			}
+			steps := m.Steps()
+			if strings.Contains(steps, "finish") {
+				t.Fatalf("finish called after error: %s", steps)
+			}
+			if !strings.HasSuffix(steps, tc.last) {
+				t.Fatalf("steps %s, want last %s", steps, tc.last)
+			}
+			if m.ossCookie {
+				t.Fatal("cookie sent to OSS")
+			}
+		})
+	}
+}
+
+func TestUploadFinishError(t *testing.T) {
+	m := newUpMock(t)
+	m.fail["finish"] = 0
+	p, _ := testFile(t)
+	var ae *APIError
+	if err := newUpClient(t, m).Upload(context.Background(), p, "/docs"); !errors.As(err, &ae) {
+		t.Fatalf("want APIError, got %v", err)
+	}
+}
+
+func TestUploadTimeout(t *testing.T) {
+	m := newUpMock(t)
+	m.blockPart = 2
+	p, _ := testFile(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := newUpClient(t, m).Upload(ctx, p, "/docs")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("want deadline exceeded, got %v", err)
+	}
+	if time.Since(start) > 5*time.Second {
+		t.Fatal("timeout not honored")
+	}
+	if s := m.Steps(); strings.Contains(s, "hash") || strings.Contains(s, "finish") || strings.Contains(s, "put3") {
+		t.Fatalf("continued after timeout: %s", s)
+	}
+}
+
+func TestUploadCancel(t *testing.T) {
+	m := newUpMock(t)
+	m.blockPart = 3
+	m.partReady = make(chan struct{})
+	p, _ := testFile(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { <-m.partReady; cancel() }()
+	err := newUpClient(t, m).Upload(ctx, p, "/docs")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("want canceled, got %v", err)
+	}
+	if s := m.Steps(); strings.Contains(s, "hash") || strings.Contains(s, "finish") {
+		t.Fatalf("continued after cancel: %s", s)
+	}
+}
+
+func TestUploadPrecanceled(t *testing.T) {
+	m := newUpMock(t)
+	p, _ := testFile(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := newUpClient(t, m).Upload(ctx, p, "/docs"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v", err)
+	}
+	if s := m.Steps(); s != "" {
+		t.Fatalf("requests sent: %s", s)
+	}
+}
+
+func TestUploadLocalErrors(t *testing.T) {
+	m := newUpMock(t)
+	c := newUpClient(t, m)
+	dir := t.TempDir()
+	empty := filepath.Join(dir, "e.bin")
+	os.WriteFile(empty, nil, 0o600)
+	if err := c.Upload(context.Background(), empty, "/docs"); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("empty: %v", err)
+	}
+	if err := c.Upload(context.Background(), dir, "/docs"); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("dir: %v", err)
+	}
+	if err := c.Upload(context.Background(), filepath.Join(dir, "missing"), "/docs"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing: %v", err)
+	}
+	if s := m.Steps(); s != "" {
+		t.Fatalf("requests sent: %s", s)
+	}
+	p, _ := testFile(t)
+	if err := c.Upload(context.Background(), p, "/nope"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("remote dir: %v", err)
+	}
+}
+
+func TestOSSObjectURL(t *testing.T) {
+	u, err := ossObjectURL("pds.quark.cn", "b-1", "a/b c")
+	if err != nil || u.String() != "https://b-1.pds.quark.cn/a/b%20c" {
+		t.Fatalf("%v %v", u, err)
+	}
+	for _, k := range []string{"", "/a", "a/../b", "a?x", "a#x", "a//b", "a\\b", "a%2f"} {
+		if _, err := ossObjectURL("pds.quark.cn", "b-1", k); !errors.Is(err, ErrUntrustedURL) {
+			t.Errorf("objkey %q accepted", k)
+		}
+	}
+	for _, h := range []string{"pds.quark.cn.evil.com", "quark.cn@evil.com", "https://pds.quark.cn/path", "https://pds.quark.cn?x=1"} {
+		if _, err := ossObjectURL(h, "b-1", "k"); !errors.Is(err, ErrUntrustedURL) {
+			t.Errorf("upload_url %q accepted", h)
+		}
+	}
+}
