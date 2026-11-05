@@ -89,6 +89,10 @@ unset QDRIVE_COOKIE
 - 为保护凭据和本地文件，传输只接受 HTTPS 的 `quark.cn` 域名；服务端返回其他域名时会拒绝。
 - 大文件下载重试、异步下载及上传流程有模拟测试，但尚未用真实账号验证。
 
+## Agent Skill
+
+仓库内置 [QDrive Skill](skills/qdrive/SKILL.md)，供支持 Skill 的智能体了解 CLI 用法和凭据安全边界。请按所用智能体客户端的方式安装或加载；放在仓库中不会自动对所有客户端生效。
+
 ## 测试
 
 ```sh
