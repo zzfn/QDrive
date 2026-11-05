@@ -1,0 +1,72 @@
+name: release
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p build dist
+          go build -trimpath -o build/qdrive ./cmd/qdrive
+
+      - name: Package
+        run: |
+          name=qdrive-linux-${{ matrix.arch }}.tar.gz
+          tar -C build -czf "dist/${name}" qdrive
+          cd dist && sha256sum "${name}" > "${name}.sha256"
+
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          name: qdrive-linux-${{ matrix.arch }}
+          path: |
+            dist/qdrive-linux-${{ matrix.arch }}.tar.gz
+            dist/qdrive-linux-${{ matrix.arch }}.tar.gz.sha256
+          retention-days: 1
+
+  release:
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: write
+    steps:
+      - name: Download all packages
+        uses: actions/download-artifact@v8
+        with:
+          pattern: qdrive-linux-*
+          path: dist/
+          merge-multiple: true
+
+      - name: Verify checksums
+        run: cd dist && sha256sum -c *.sha256
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256

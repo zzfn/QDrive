@@ -4,7 +4,24 @@
 
 > QDrive 使用非官方接口，接口变动或账号风控可能导致功能失效。扫码获取二维码已验证，扫码后的登录、列表和文件传输尚未使用真实账号完整验证。
 
-## 构建
+## Linux 安装
+
+首个 GitHub Release 发布后，可以用以下命令安装最新版本，支持 Linux amd64 和 arm64：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/zzfn/QDrive/main/scripts/install.sh | sh
+```
+
+默认安装到 `~/.local/bin/qdrive`。安装脚本会校验发布包的 SHA-256，并在目标文件已存在时替换它；如果 `~/.local/bin` 不在 `PATH` 中，按脚本提示添加。也可以指定版本或安装目录：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/zzfn/QDrive/main/scripts/install.sh | QDRIVE_VERSION=v0.1.0 sh
+curl -fsSL https://raw.githubusercontent.com/zzfn/QDrive/main/scripts/install.sh | QDRIVE_INSTALL_DIR="$HOME/bin" sh
+```
+
+目前尚未发布首个版本，安装命令在首个 Release 发布前无法使用。
+
+## 从源码构建
 
 需要 Go 1.27.3 或更高版本：
 
@@ -77,6 +94,9 @@ unset QDRIVE_COOKIE
 ```sh
 go test ./...
 go vet ./...
+sh scripts/test-install.sh
 ```
+
+推送 `v*` 标签会触发 GitHub Actions，构建 Linux amd64 和 arm64 安装包及校验文件，并创建对应的 GitHub Release。
 
 网盘协议和 CLI 自行实现；终端二维码渲染使用 [go-qrcode](https://github.com/skip2/go-qrcode)。
