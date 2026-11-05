@@ -62,12 +62,13 @@
 
   $work = Join-Path ([System.IO.Path]::GetTempPath()) ('qdrive-install-' + [Guid]::NewGuid().ToString('N'))
   $staged = $null
+  $backup = $null
   try {
     New-Item -ItemType Directory -Path $work | Out-Null
     $archive = Join-Path $work $asset
     $sumFile = "$archive.sha256"
 
-    Write-Host "Downloading $url"
+    Write-Output "Downloading $url"
     try { Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing }
     catch { Fail "download failed: $url (release $version may not be published yet; see https://github.com/$repository/releases)" }
     try { Invoke-WebRequest -Uri "$url.sha256" -OutFile $sumFile -UseBasicParsing }
@@ -114,22 +115,28 @@
     $staged = Join-Path $bin ('.qdrive.' + [Guid]::NewGuid().ToString('N') + '.tmp')
     try {
       [System.IO.File]::Copy($extracted, $staged, $false)
-      if (Test-Path -LiteralPath $target) { [System.IO.File]::Replace($staged, $target, $null) }
-      else { [System.IO.File]::Move($staged, $target) }
+      if (Test-Path -LiteralPath $target) {
+        # A real backup path also works on Windows PowerShell 5.1, where a null
+        # string argument can be converted to an empty path.
+        $backup = Join-Path $bin ('.qdrive.' + [Guid]::NewGuid().ToString('N') + '.bak')
+        [System.IO.File]::Replace($staged, $target, $backup)
+      } else { [System.IO.File]::Move($staged, $target) }
       $staged = $null
     } catch {
       Fail "cannot write $target (is qdrive running? no elevation is used; set QDRIVE_INSTALL_DIR to a writable directory)"
     }
 
-    Write-Host "Installed qdrive ($version) to $target"
+    Write-Output "Installed qdrive ($version) to $target"
     $norm = $bin.TrimEnd('\', '/')
     $onPath = @("$env:Path".Split(';') | Where-Object { $_ -and $_.Trim().TrimEnd('\', '/') -eq $norm }).Count -gt 0
     if (-not $onPath) {
-      Write-Host "Note: $bin is not in your PATH. Add it yourself, e.g.:"
-      Write-Host "  [Environment]::SetEnvironmentVariable('Path', '$($bin.Replace("'", "''"));' + [Environment]::GetEnvironmentVariable('Path', 'User'), 'User')"
+      Write-Output "Note: $bin is not in your PATH. Add it yourself, e.g.:"
+      Write-Output "  [Environment]::SetEnvironmentVariable('Path', '$($bin.Replace("'", "''"));' + [Environment]::GetEnvironmentVariable('Path', 'User'), 'User')"
     }
   } finally {
     if ($staged -and (Test-Path -LiteralPath $staged)) { Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue }
+    # Preserve the backup if a failed replacement left the target missing.
+    if ($backup -and (Test-Path -LiteralPath $target) -and (Test-Path -LiteralPath $backup)) { Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue }
     if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue }
   }
 }
