@@ -30,11 +30,12 @@ jobs:
           CGO_ENABLED: "0"
           GOOS: ${{ matrix.os }}
           GOARCH: ${{ matrix.arch }}
+          BUILD_VERSION: ${{ github.ref_name }}
         run: |
           mkdir -p build dist
           bin=qdrive
           if [ "$GOOS" = windows ]; then bin=qdrive.exe; fi
-          go build -trimpath -o "build/${bin}" ./cmd/qdrive
+          go build -trimpath -ldflags "-X main.version=$BUILD_VERSION" -o "build/${bin}" ./cmd/qdrive
 
       - name: Package
         run: |

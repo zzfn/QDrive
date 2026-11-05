@@ -35,9 +35,12 @@ import (
 //  4. unless finish: POST upload/auth + POST OSS ?uploadId=.. (complete)
 //  5. POST upload/finish
 //
+// Part PUTs are retried on transient transport errors (upload_retry.go);
+// no other step is retried.
+//
 // Only a fresh, sequential, single-file upload into an existing directory is
-// implemented. Resume, parallel parts, directory creation and overwrite are
-// not.
+// implemented (optionally reporting per-part progress). Resume, parallel
+// parts, directory creation and overwrite are not; see UploadProgress.
 const (
 	uploadPrePath    = "/1/clouddrive/file/upload/pre"
 	uploadHashPath   = "/1/clouddrive/file/update/hash"
@@ -78,6 +81,25 @@ type uploadSession struct {
 // Upload uploads the regular file at localPath into the existing remote
 // directory remoteDir, keeping the local base name. It never overwrites.
 func (c *Client) Upload(ctx context.Context, localPath string, remoteDir string) error {
+	return c.UploadProgress(ctx, localPath, remoteDir, nil)
+}
+
+// UploadProgress is Upload with an optional progress callback. If progress
+// is non-nil it is called synchronously from the uploading goroutine with
+// (0, total) once the upload session is created, and then after each part
+// has been accepted by OSS with the cumulative byte count of accepted parts.
+// done == total means every part is stored, not that the file is committed;
+// the upload is complete only when UploadProgress returns nil. The callback
+// must not block for long and must not call back into the Client.
+//
+// Uploads are not resumable: an interrupted upload restarts from scratch on
+// the next call.
+func (c *Client) UploadProgress(ctx context.Context, localPath string, remoteDir string, progress func(done, total int64)) error {
+	report := func(done, total int64) {
+		if progress != nil {
+			progress(done, total)
+		}
+	}
 	f, err := os.Open(localPath)
 	if err != nil {
 		return fmt.Errorf("quark: upload: %w", err)
@@ -132,6 +154,7 @@ func (c *Client) Upload(ctx context.Context, localPath string, remoteDir string)
 	md5h, sha1h := md5.New(), sha1.New()
 	chain := sha1.New() // state before current part, for X-Oss-Hash-Ctx
 	buf := make([]byte, min(s.partSize, size))
+	report(0, size)
 	var etags []string
 	var done int64
 	for part := 1; done < size; part++ {
@@ -152,7 +175,7 @@ func (c *Client) Upload(ctx context.Context, localPath string, remoteDir string)
 				return err
 			}
 		}
-		etag, err := c.uploadPart(ctx, s, mimeType, part, chunk, hctx)
+		etag, err := c.uploadPartRetry(ctx, s, mimeType, part, chunk, hctx)
 		if err != nil {
 			return err
 		}
@@ -161,6 +184,7 @@ func (c *Client) Upload(ctx context.Context, localPath string, remoteDir string)
 		sha1h.Write(chunk)
 		chain.Write(chunk)
 		done += n
+		report(done, size)
 	}
 	// The file must not have grown or been replaced while reading.
 	if extra, _ := f.Read(make([]byte, 1)); extra != 0 {
@@ -432,6 +456,11 @@ func (c *Client) uploadPart(ctx context.Context, s *uploadSession, mimeType stri
 		return "", fmt.Errorf("quark: upload part %d: %w", part, err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusConflict {
+		// A previous attempt may have stored this part before its response
+		// was lost; accept it only if its ETag matches our data.
+		return partAlreadyExistETag(resp, part, chunk)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return "", httpErr("upload part "+strconv.Itoa(part), resp)
 	}

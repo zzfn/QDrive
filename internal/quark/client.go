@@ -139,6 +139,11 @@ func isQuarkURL(u *url.URL) bool {
 	return h == "quark.cn" || strings.HasSuffix(h, ".quark.cn")
 }
 
+// Stat resolves a path to its file or directory metadata.
+func (c *Client) Stat(ctx context.Context, remotePath string) (File, error) {
+	return c.resolve(ctx, remotePath)
+}
+
 // List returns the entries of the directory at remotePath ("/" is root).
 func (c *Client) List(ctx context.Context, remotePath string) ([]File, error) {
 	f, err := c.resolve(ctx, remotePath)
