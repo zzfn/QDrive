@@ -13,6 +13,7 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
+        os: [linux, windows]
         arch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v6
@@ -27,25 +28,33 @@ jobs:
       - name: Build
         env:
           CGO_ENABLED: "0"
-          GOOS: linux
+          GOOS: ${{ matrix.os }}
           GOARCH: ${{ matrix.arch }}
         run: |
           mkdir -p build dist
-          go build -trimpath -o build/qdrive ./cmd/qdrive
+          bin=qdrive
+          if [ "$GOOS" = windows ]; then bin=qdrive.exe; fi
+          go build -trimpath -o "build/${bin}" ./cmd/qdrive
 
       - name: Package
         run: |
-          name=qdrive-linux-${{ matrix.arch }}.tar.gz
-          tar -C build -czf "dist/${name}" qdrive
+          base=qdrive-${{ matrix.os }}-${{ matrix.arch }}
+          if [ "${{ matrix.os }}" = windows ]; then
+            name=${base}.zip
+            (cd build && zip -9 -X "../dist/${name}" qdrive.exe)
+          else
+            name=${base}.tar.gz
+            tar -C build -czf "dist/${name}" qdrive
+          fi
           cd dist && sha256sum "${name}" > "${name}.sha256"
 
       - name: Upload package
         uses: actions/upload-artifact@v7
         with:
-          name: qdrive-linux-${{ matrix.arch }}
+          name: qdrive-${{ matrix.os }}-${{ matrix.arch }}
           path: |
-            dist/qdrive-linux-${{ matrix.arch }}.tar.gz
-            dist/qdrive-linux-${{ matrix.arch }}.tar.gz.sha256
+            dist/qdrive-${{ matrix.os }}-${{ matrix.arch }}.*
+          if-no-files-found: error
           retention-days: 1
 
   release:
@@ -57,12 +66,18 @@ jobs:
       - name: Download all packages
         uses: actions/download-artifact@v8
         with:
-          pattern: qdrive-linux-*
+          pattern: qdrive-*
           path: dist/
           merge-multiple: true
 
       - name: Verify checksums
-        run: cd dist && sha256sum -c *.sha256
+        run: |
+          cd dist
+          ls -l
+          for f in qdrive-linux-amd64.tar.gz qdrive-linux-arm64.tar.gz qdrive-windows-amd64.zip qdrive-windows-arm64.zip; do
+            test -f "$f" && test -f "$f.sha256"
+          done
+          sha256sum -c *.sha256
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v3
@@ -70,3 +85,6 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
+            dist/*.zip
+            dist/*.zip.sha256
+          fail_on_unmatched_files: true

@@ -1,7 +1,9 @@
 // Package credential stores the QDrive session cookie on local disk.
 //
 // The cookie is written to os.UserConfigDir()/qdrive/credentials.json with
-// directory mode 0700 and file mode 0600 (on Unix-like systems). Writes go
+// directory mode 0700 and file mode 0600 (on Unix-like systems). On Windows
+// the directory, temporary file and credentials file instead get a protected
+// DACL that grants access only to the current user's SID (see acl_windows.go). Writes go
 // through a temporary file in the same directory followed by an atomic rename,
 // so readers never observe a partially written file. Cookie values are never
 // included in error messages.
@@ -65,7 +67,7 @@ func ensureDir(dir string) error {
 	if err := os.MkdirAll(filepath.Dir(dir), dirPerm); err != nil {
 		return fmt.Errorf("credential: create config dir: %w", err)
 	}
-	if err := os.Mkdir(dir, dirPerm); err != nil && !errors.Is(err, fs.ErrExist) {
+	if err := mkdirPrivate(dir); err != nil && !errors.Is(err, fs.ErrExist) {
 		return fmt.Errorf("credential: create dir: %w", err)
 	}
 	fi, err := os.Lstat(dir)
@@ -79,6 +81,9 @@ func ensureDir(dir string) error {
 		if err := os.Chmod(dir, dirPerm); err != nil {
 			return fmt.Errorf("credential: restrict dir permissions: %w", err)
 		}
+	}
+	if err := restrictPath(dir); err != nil {
+		return fmt.Errorf("credential: restrict dir ACL: %w", err)
 	}
 	return nil
 }
@@ -107,7 +112,8 @@ func Save(cookie string) (err error) {
 	data = append(data, '\n')
 
 	// CreateTemp uses O_EXCL and mode 0600 with an unpredictable name.
-	tmp, err := os.CreateTemp(dir, ".credentials-*.tmp")
+	// On Windows the private DACL is applied at creation time.
+	tmp, err := createPrivateTemp(dir)
 	if err != nil {
 		return fmt.Errorf("credential: create temp file: %w", err)
 	}
@@ -135,6 +141,9 @@ func Save(cookie string) (err error) {
 	}
 	if err = os.Rename(tmpName, path); err != nil {
 		return fmt.Errorf("credential: replace credentials file: %w", err)
+	}
+	if err = restrictPath(path); err != nil {
+		return fmt.Errorf("credential: restrict file ACL: %w", err)
 	}
 	syncDir(dir)
 	return nil
@@ -171,6 +180,9 @@ func Load() (string, error) {
 		if err := os.Chmod(path, filePerm); err != nil {
 			return "", fmt.Errorf("credential: restrict file permissions: %w", err)
 		}
+	}
+	if err := restrictPath(path); err != nil {
+		return "", fmt.Errorf("credential: restrict file ACL: %w", err)
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
