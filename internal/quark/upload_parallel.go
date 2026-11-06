@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/md5"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -61,14 +62,28 @@ type partJob struct {
 	part int
 	buf  []byte
 	hctx string
+	sha  string // lowercase hex SHA-256 of buf
 }
 
 type partResult struct {
-	part int
-	size int64
-	etag string
-	buf  []byte // returned to the pool; nil for producer results
-	err  error
+	part    int
+	size    int64
+	etag    string
+	sha     string // lowercase hex SHA-256 of the part data
+	skipped bool   // already recorded in the resume state; not re-sent
+	buf     []byte // returned to the pool; nil for producer error results
+	err     error
+}
+
+// partResume carries resume information into uploadParts. known parts are
+// skipped only if the freshly read part has exactly the recorded SHA-256.
+// commit is called from the calling goroutine after each newly accepted
+// part, before progress is reported; an error stops the upload.
+type partResume struct {
+	known        map[int]resumePart
+	initialBytes int64  // validated, previously accepted bytes
+	fileSHA256   string // expected whole-file SHA-256 (lowercase hex)
+	commit       func(part int, etag, sha string) error
 }
 
 type partsOutcome struct {
@@ -82,7 +97,7 @@ type partsOutcome struct {
 // only from the calling goroutine, with a non-decreasing byte count. On any
 // error (or cancellation) all goroutines are stopped and awaited before
 // returning; nothing is reported as committed.
-func (c *Client) uploadParts(parent context.Context, f *os.File, st os.FileInfo, s *uploadSession, mimeType string, size int64, progress func(done, total int64)) (*partsOutcome, error) {
+func (c *Client) uploadParts(parent context.Context, f *os.File, st os.FileInfo, s *uploadSession, mimeType string, size int64, res *partResume, progress func(done, total int64)) (*partsOutcome, error) {
 	partSize := s.partSize
 	totalParts := int(1 + (size-1)/partSize)
 	workers := uploadWorkers(s.partThread, partSize, size)
@@ -113,7 +128,9 @@ func (c *Client) uploadParts(parent context.Context, f *os.File, st os.FileInfo,
 			results <- partResult{err: err}
 			cancel()
 		}
-		md5h, sha1h, chain := md5.New(), sha1.New(), sha1.New()
+		md5h, sha1h, chain, whole := md5.New(), sha1.New(), sha1.New(), sha256.New()
+		// Always read from offset 0, independent of the handle's position.
+		rd := io.NewSectionReader(f, 0, size)
 		var off int64
 		for part := 1; part <= totalParts; part++ {
 			var buf []byte
@@ -124,7 +141,7 @@ func (c *Client) uploadParts(parent context.Context, f *os.File, st os.FileInfo,
 			}
 			n := min(partSize, size-off)
 			chunk := buf[:n]
-			if _, err := io.ReadFull(f, chunk); err != nil {
+			if _, err := io.ReadFull(rd, chunk); err != nil {
 				if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 					fail(ErrFileChanged)
 				} else {
@@ -143,20 +160,45 @@ func (c *Client) uploadParts(parent context.Context, f *os.File, st os.FileInfo,
 			md5h.Write(chunk)
 			sha1h.Write(chunk)
 			chain.Write(chunk)
+			whole.Write(chunk)
+			psum := sha256.Sum256(chunk)
+			psha := hex.EncodeToString(psum[:])
 			off += n
+			if res != nil {
+				if kp, ok := res.known[part]; ok {
+					if kp.SHA256 != psha {
+						fail(fmt.Errorf("%w: part %d differs from resume state", ErrFileChanged, part))
+						return
+					}
+					// Recorded and identical: reuse its ETag, do not re-send.
+					select {
+					case results <- partResult{part: part, size: n, etag: kp.ETag, sha: psha, skipped: true, buf: buf[:cap(buf)]}:
+					case <-ctx.Done():
+						return
+					}
+					continue
+				}
+			}
 			select {
-			case jobs <- partJob{part: part, buf: chunk, hctx: hctx}:
+			case jobs <- partJob{part: part, buf: chunk, hctx: hctx, sha: psha}:
 			case <-ctx.Done():
 				return
 			}
 		}
 		// The file must not have grown or been replaced while reading.
-		if extra, _ := f.Read(make([]byte, 1)); extra != 0 {
+		if extra, readErr := f.ReadAt(make([]byte, 1), size); extra != 0 {
+			fail(ErrFileChanged)
+			return
+		} else if readErr != nil && !errors.Is(readErr, io.EOF) {
+			fail(fmt.Errorf("quark: upload: read end of file: %w", readErr))
+			return
+		}
+		if st2, err := f.Stat(); err != nil || st2.Size() != size || !sameLocal(st, st2) {
 			fail(ErrFileChanged)
 			return
 		}
-		if st2, err := f.Stat(); err != nil || st2.Size() != size || !st2.ModTime().Equal(st.ModTime()) {
-			fail(ErrFileChanged)
+		if res != nil && hex.EncodeToString(whole.Sum(nil)) != res.fileSHA256 {
+			fail(fmt.Errorf("%w: content differs from the pre-upload hash", ErrFileChanged))
 			return
 		}
 		out.md5hex = hex.EncodeToString(md5h.Sum(nil))
@@ -168,7 +210,7 @@ func (c *Client) uploadParts(parent context.Context, f *os.File, st os.FileInfo,
 		go func() {
 			defer wg.Done()
 			for job := range jobs {
-				r := partResult{part: job.part, size: int64(len(job.buf)), buf: job.buf[:cap(job.buf)]}
+				r := partResult{part: job.part, size: int64(len(job.buf)), sha: job.sha, buf: job.buf[:cap(job.buf)]}
 				if err := ctx.Err(); err != nil {
 					r.err = err
 				} else {
@@ -186,6 +228,9 @@ func (c *Client) uploadParts(parent context.Context, f *os.File, st os.FileInfo,
 
 	etags := make([]string, totalParts)
 	var done int64
+	if res != nil {
+		done = res.initialBytes
+	}
 	var firstErr error
 	isCtx := func(err error) bool {
 		return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
@@ -208,10 +253,21 @@ func (c *Client) uploadParts(parent context.Context, f *os.File, st os.FileInfo,
 		if firstErr != nil {
 			continue // late success after a failure: ignore, no progress
 		}
+		if !r.skipped && res != nil && res.commit != nil {
+			// Persist etag+hash before counting the part as done. On failure
+			// stop; the part is re-sent next time (409 check applies).
+			if err := res.commit(r.part, r.etag, r.sha); err != nil {
+				firstErr = fmt.Errorf("quark: upload: save resume state after part %d (nothing committed): %w", r.part, err)
+				cancel()
+				continue
+			}
+		}
 		etags[r.part-1] = r.etag
-		done += r.size
-		if progress != nil {
-			progress(done, size)
+		if !r.skipped {
+			done += r.size
+			if progress != nil {
+				progress(done, size)
+			}
 		}
 	}
 	// results is closed only after wg.Wait: every goroutine has exited.

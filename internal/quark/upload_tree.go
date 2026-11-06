@@ -13,9 +13,9 @@ import (
 // Directory uploads run in two phases:
 //
 //  1. plan: walk the local tree with Lstat/ReadDir only (symlinks are never
-//     followed), validating every name, rejecting symlinks, special files and
-//     empty files, and enforcing item and depth limits. Nothing remote is
-//     touched until the whole plan is valid.
+//     followed), validating every name, rejecting symlinks and special files,
+//     and enforcing item and depth limits. Nothing remote is touched until the
+//     whole plan is valid.
 //  2. apply: create/merge directories parent-first, then upload files with
 //     UploadProgress. Existing remote names observed in listings are counted
 //     as conflicts and the walk continues. The server has no verified atomic
@@ -340,9 +340,7 @@ func planUploadTree(ctx context.Context, localPath string) (*upNode, error) {
 				k.isDir = true
 				queue = append(queue, k)
 			case mode.IsRegular():
-				if fi.Size() == 0 {
-					return nil, fmt.Errorf("%w: empty file %s", ErrUnsupported, rel)
-				}
+				// Regular files, including empty files, use the same upload path.
 			default:
 				return nil, fmt.Errorf("%w: not a regular file: %s", ErrUnsupported, rel)
 			}

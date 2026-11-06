@@ -18,12 +18,74 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+// TestMain makes sure no test can reach the real per-user upload-state
+// directory: every upload test must install an in-memory store.
+func TestMain(m *testing.M) {
+	openUploadState = func(string) (uploadStateStore, error) {
+		return nil, errors.New("test must install an in-memory upload state store")
+	}
+	os.Exit(m.Run())
+}
+
+// memUploads is an in-memory upload state store shared by every client
+// created for one upMock, so a second attempt sees the first one's record.
+type memUploads struct {
+	mu   sync.Mutex
+	data map[string][]byte
+}
+
+type memUploadHandle struct {
+	s   *memUploads
+	key string
+}
+
+func (h memUploadHandle) Load() ([]byte, error) {
+	h.s.mu.Lock()
+	defer h.s.mu.Unlock()
+	d, ok := h.s.data[h.key]
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	return bytes.Clone(d), nil
+}
+
+func (h memUploadHandle) Save(d []byte) error {
+	h.s.mu.Lock()
+	defer h.s.mu.Unlock()
+	h.s.data[h.key] = bytes.Clone(d)
+	return nil
+}
+
+func (h memUploadHandle) Clear() error {
+	h.s.mu.Lock()
+	defer h.s.mu.Unlock()
+	delete(h.s.data, h.key)
+	return nil
+}
+
+func (memUploadHandle) Close() error { return nil }
+
+func (s *memUploads) records() []resumeState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []resumeState
+	for _, d := range s.data {
+		var rs resumeState
+		if err := json.Unmarshal(d, &rs); err != nil {
+			panic(err)
+		}
+		out = append(out, rs)
+	}
+	return out
+}
 
 // upMock is a fake Quark API + OSS endpoint. All hosts are routed to one
 // local TLS server, so the production host checks (isQuarkURL) stay active.
@@ -49,14 +111,32 @@ type upMock struct {
 	hashBody   map[string]string
 	finishBody map[string]string
 	ossCookie  bool
+	fileName   string
+	fileSize   int64
+	partThread int
+	state      *memUploads
 }
 
 const testBucket = "ul-bucket"
 
 func newUpMock(t *testing.T) *upMock {
-	return &upMock{t: t, parts: map[int][]byte{}, ctxs: map[int]string{}, fail: map[string]int{},
+	m := &upMock{t: t, parts: map[int][]byte{}, ctxs: map[int]string{}, fail: map[string]int{},
 		uploadURL: "http://pds.quark.cn", bucket: testBucket, partSize: 64,
-		callback: map[string]any{"callbackUrl": "https://x.quark.cn/cb", "callbackBody": "a=${x}"}}
+		callback: map[string]any{"callbackUrl": "https://x.quark.cn/cb", "callbackBody": "a=${x}"},
+		fileName: "a.bin", fileSize: 150, partThread: 3,
+		state: &memUploads{data: map[string][]byte{}}}
+	prev := openUploadState
+	openUploadState = func(key string) (uploadStateStore, error) {
+		return memUploadHandle{s: m.state, key: key}, nil
+	}
+	t.Cleanup(func() { openUploadState = prev })
+	return m
+}
+
+func (m *upMock) resetSteps() {
+	m.mu.Lock()
+	m.steps = nil
+	m.mu.Unlock()
 }
 
 func (m *upMock) step(s string) {
@@ -118,14 +198,16 @@ func (m *upMock) api(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("pdir_fid") == rootID {
 			list = append(list, map[string]any{"fid": "d1", "file_name": "docs", "dir": true})
 		} else {
+			m.mu.Lock()
 			for _, e := range m.existing {
-				list = append(list, map[string]any{"fid": e.fid, "file_name": e.name, "dir": e.dir})
+				list = append(list, map[string]any{"fid": e.fid, "file_name": e.name, "dir": e.dir, "size": e.size})
 			}
+			m.mu.Unlock()
 		}
 		ok(map[string]any{"list": list})
 	case uploadPrePath:
 		m.step("pre")
-		if body["pdir_fid"] != "d1" || body["file_name"] != "a.bin" || body["size"] != float64(150) ||
+		if body["pdir_fid"] != "d1" || body["file_name"] != m.fileName || body["size"] != float64(m.fileSize) ||
 			body["format_type"] != "application/octet-stream" {
 			m.t.Errorf("bad pre body %v", body)
 		}
@@ -135,7 +217,7 @@ func (m *upMock) api(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"status": 200, "code": 0,
 			"data": map[string]any{"task_id": "T1", "bucket": m.bucket, "obj_key": "ul/obj 1",
 				"upload_id": "U1", "upload_url": m.uploadURL, "auth_info": "AI", "callback": m.callback},
-			"metadata": map[string]any{"part_size": m.partSize, "part_thread": 3}})
+			"metadata": map[string]any{"part_size": m.partSize, "part_thread": m.partThread}})
 	case uploadAuthPath:
 		m.step("auth")
 		if body["task_id"] != "T1" || body["auth_info"] != "AI" {
@@ -167,6 +249,10 @@ func (m *upMock) api(w http.ResponseWriter, r *http.Request) {
 		if m.failed(w, "finish") {
 			return
 		}
+		// The committed file becomes visible to the post-finish check.
+		m.mu.Lock()
+		m.existing = append(m.existing, entry{fid: "F1", name: m.fileName, size: m.fileSize})
+		m.mu.Unlock()
 		ok(map[string]any{"fid": "F1"})
 	default:
 		m.t.Errorf("unexpected api %s", r.URL.Path)
@@ -224,6 +310,7 @@ func newUpClient(t *testing.T, m *upMock) *Client {
 	t.Cleanup(srv.Close)
 	addr := srv.Listener.Addr().String()
 	c := New(testCookie)
+	c.pollInterval = time.Millisecond // keep failed post-finish checks fast
 	c.hc.Transport = &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
@@ -252,9 +339,16 @@ func TestUploadSuccess(t *testing.T) {
 	if err := c.Upload(context.Background(), p, "/docs"); err != nil {
 		t.Fatal(err)
 	}
-	want := "list,list,pre,auth,put1,auth,put2,auth,put3,hash,auth,commit,finish"
-	if got := m.Steps(); got != want {
-		t.Fatalf("steps\n got %s\nwant %s", got, want)
+	// Parts are sent concurrently, so only the phases are ordered.
+	steps := strings.Split(m.Steps(), ",")
+	if len(steps) != 14 || strings.Join(steps[:3], ",") != "list,list,pre" ||
+		strings.Join(steps[9:], ",") != "hash,auth,commit,finish,list" {
+		t.Fatalf("steps %s", m.Steps())
+	}
+	mid := slices.Clone(steps[3:9])
+	slices.Sort(mid)
+	if strings.Join(mid, ",") != "auth,auth,auth,put1,put2,put3" {
+		t.Fatalf("part steps %s", m.Steps())
 	}
 	if m.ossCookie {
 		t.Fatal("cookie sent to OSS")
@@ -273,17 +367,29 @@ func TestUploadSuccess(t *testing.T) {
 	if string(m.commitBody) != wantXML {
 		t.Fatalf("commit body %s", m.commitBody)
 	}
-	// Signed metadata mirrors the actual requests.
-	if !strings.HasPrefix(m.metas[0], "PUT\n\napplication/octet-stream\n") || strings.Contains(m.metas[0], "X-Oss-Hash-Ctx") ||
-		!strings.HasSuffix(m.metas[0], "\n/"+testBucket+"/ul/obj 1?partNumber=1&uploadId=U1") {
-		t.Fatalf("meta1 %q", m.metas[0])
+	// Signed metadata mirrors the actual requests (auth order is not fixed).
+	metaFor := func(suffix string) string {
+		t.Helper()
+		for _, s := range m.metas {
+			if strings.HasSuffix(s, suffix) {
+				return s
+			}
+		}
+		t.Fatalf("no signed meta ending in %q: %q", suffix, m.metas)
+		return ""
 	}
-	if !strings.Contains(m.metas[1], "X-Oss-Hash-Ctx:"+m.ctxs[2]+"\n") || !strings.HasSuffix(m.metas[1], "?partNumber=2&uploadId=U1") {
-		t.Fatalf("meta2 %q", m.metas[1])
+	meta1 := metaFor("\n/" + testBucket + "/ul/obj 1?partNumber=1&uploadId=U1")
+	if !strings.HasPrefix(meta1, "PUT\n\napplication/octet-stream\n") || strings.Contains(meta1, "X-Oss-Hash-Ctx") {
+		t.Fatalf("meta1 %q", meta1)
 	}
-	if !strings.HasPrefix(m.metas[3], "POST\n") || !strings.Contains(m.metas[3], "\napplication/xml\n") ||
-		!strings.HasSuffix(m.metas[3], "/"+testBucket+"/ul/obj 1?uploadId=U1") {
-		t.Fatalf("commit meta %q", m.metas[3])
+	if meta2 := metaFor("?partNumber=2&uploadId=U1"); !strings.Contains(meta2, "X-Oss-Hash-Ctx:"+m.ctxs[2]+"\n") {
+		t.Fatalf("meta2 %q", meta2)
+	}
+	if cm := metaFor("/" + testBucket + "/ul/obj 1?uploadId=U1"); !strings.HasPrefix(cm, "POST\n") || !strings.Contains(cm, "\napplication/xml\n") {
+		t.Fatalf("commit meta %q", cm)
+	}
+	if len(m.state.records()) != 0 {
+		t.Fatal("resume state not cleared after a verified upload")
 	}
 	// Each hash ctx must be the SHA-1 state over all previous parts.
 	if m.ctxs[1] != "" {
@@ -338,7 +444,7 @@ func TestUploadRapidSkipsCommit(t *testing.T) {
 	if err := newUpClient(t, m).Upload(context.Background(), p, "/docs"); err != nil {
 		t.Fatal(err)
 	}
-	if got := m.Steps(); strings.Contains(got, "commit") || !strings.HasSuffix(got, "hash,finish") {
+	if got := m.Steps(); strings.Contains(got, "commit") || !strings.HasSuffix(got, "hash,finish,list") {
 		t.Fatalf("steps %s", got)
 	}
 }
@@ -384,7 +490,12 @@ func TestUploadErrorsNeverFinish(t *testing.T) {
 			if strings.Contains(steps, "finish") {
 				t.Fatalf("finish called after error: %s", steps)
 			}
-			if !strings.HasSuffix(steps, tc.last) {
+			if strings.HasPrefix(tc.last, "put") {
+				// Other parts run concurrently and may finish later.
+				if !strings.Contains(steps, tc.last) || strings.Contains(steps, "hash") {
+					t.Fatalf("steps %s, want %s and no commit phase", steps, tc.last)
+				}
+			} else if !strings.HasSuffix(steps, tc.last) {
 				t.Fatalf("steps %s, want last %s", steps, tc.last)
 			}
 			if m.ossCookie {
@@ -394,13 +505,137 @@ func TestUploadErrorsNeverFinish(t *testing.T) {
 	}
 }
 
+// A failed finish leaves the remote state unknown: the error is
+// ErrUnconfirmed and the record stays "finalizing", so a retry sends nothing.
 func TestUploadFinishError(t *testing.T) {
 	m := newUpMock(t)
 	m.fail["finish"] = 0
 	p, _ := testFile(t)
-	var ae *APIError
-	if err := newUpClient(t, m).Upload(context.Background(), p, "/docs"); !errors.As(err, &ae) {
-		t.Fatalf("want APIError, got %v", err)
+	if err := newUpClient(t, m).Upload(context.Background(), p, "/docs"); !errors.Is(err, ErrUnconfirmed) {
+		t.Fatalf("want ErrUnconfirmed, got %v", err)
+	}
+	recs := m.state.records()
+	if len(recs) != 1 || recs[0].Phase != uploadPhaseFinalizing || len(recs[0].Parts) != 3 {
+		t.Fatalf("records %+v", recs)
+	}
+	delete(m.fail, "finish")
+	m.resetSteps()
+	if err := newUpClient(t, m).Upload(context.Background(), p, "/docs"); !errors.Is(err, ErrUnconfirmed) {
+		t.Fatalf("retry: want ErrUnconfirmed, got %v", err)
+	}
+	if s := m.Steps(); strings.Contains(s, "pre") || strings.Contains(s, "put") || strings.Contains(s, "finish") {
+		t.Fatalf("retry after finalizing sent upload requests: %s", s)
+	}
+	if len(m.state.records()) != 1 {
+		t.Fatal("finalizing record removed")
+	}
+}
+
+// An interrupted upload resumes with the recorded session and only sends
+// the parts that were not accepted before.
+func TestUploadResume(t *testing.T) {
+	m := newUpMock(t)
+	m.partThread = 1 // serial parts: part 1 is accepted, part 2 fails
+	m.fail["put2"] = 403
+	p, data := testFile(t)
+	if err := newUpClient(t, m).Upload(context.Background(), p, "/docs"); err == nil {
+		t.Fatal("expected error")
+	}
+	recs := m.state.records()
+	if len(recs) != 1 || recs[0].Phase != uploadPhaseUploading || len(recs[0].Parts) != 1 || recs[0].Parts[0].N != 1 {
+		t.Fatalf("records after failure %+v", recs)
+	}
+
+	delete(m.fail, "put2")
+	m.resetSteps()
+	var first []int64
+	err := newUpClient(t, m).UploadProgress(context.Background(), p, "/docs", func(done, total int64) {
+		if first == nil {
+			first = []int64{done, total}
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := m.Steps(), "list,list,auth,put2,auth,put3,hash,auth,commit,finish,list"; got != want {
+		t.Fatalf("resume steps\n got %s\nwant %s", got, want)
+	}
+	if !slices.Equal(first, []int64{64, 150}) {
+		t.Fatalf("first progress %v, want resumed bytes", first)
+	}
+	if !bytes.Equal(bytes.Join([][]byte{m.parts[1], m.parts[2], m.parts[3]}, nil), data) {
+		t.Fatal("part bodies mismatch")
+	}
+	checkHashCtx(t, m.ctxs[3], data, 128)
+	if !strings.Contains(string(m.commitBody), `<PartNumber>1</PartNumber><ETag>"E1"</ETag>`) {
+		t.Fatalf("commit body %s", m.commitBody)
+	}
+	if len(m.state.records()) != 0 {
+		t.Fatal("resume state not cleared")
+	}
+}
+
+// A same-size content change after a partial upload is refused before any
+// further request, and the record is kept.
+func TestUploadResumeFileChanged(t *testing.T) {
+	m := newUpMock(t)
+	m.partThread = 1
+	m.fail["put2"] = 403
+	p, data := testFile(t)
+	if err := newUpClient(t, m).Upload(context.Background(), p, "/docs"); err == nil {
+		t.Fatal("expected error")
+	}
+	data[0] ^= 0xff
+	if err := os.WriteFile(p, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	delete(m.fail, "put2")
+	m.resetSteps()
+	if err := newUpClient(t, m).Upload(context.Background(), p, "/docs"); !errors.Is(err, ErrFileChanged) {
+		t.Fatalf("want ErrFileChanged, got %v", err)
+	}
+	if s := m.Steps(); strings.Contains(s, "pre") || strings.Contains(s, "auth") || strings.Contains(s, "put") {
+		t.Fatalf("changed file sent upload requests: %s", s)
+	}
+	if len(m.state.records()) != 1 {
+		t.Fatal("record not kept")
+	}
+}
+
+func TestUploadEmpty(t *testing.T) {
+	for _, rapid := range []bool{true, false} {
+		t.Run(strconv.FormatBool(rapid), func(t *testing.T) {
+			m := newUpMock(t)
+			m.rapid = rapid
+			m.fileName, m.fileSize = "e.bin", 0
+			empty := filepath.Join(t.TempDir(), "e.bin")
+			if err := os.WriteFile(empty, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			err := newUpClient(t, m).Upload(context.Background(), empty, "/docs")
+			if rapid {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if s := m.Steps(); s != "list,list,pre,hash,finish,list" {
+					t.Fatalf("steps %s", s)
+				}
+			} else {
+				if !errors.Is(err, ErrUnconfirmed) {
+					t.Fatalf("want ErrUnconfirmed, got %v", err)
+				}
+				if s := m.Steps(); s != "list,list,pre,hash" {
+					t.Fatalf("steps %s", s)
+				}
+			}
+			md5sum, sha1sum := md5.Sum(nil), sha1.Sum(nil)
+			if m.hashBody["md5"] != hex.EncodeToString(md5sum[:]) || m.hashBody["sha1"] != hex.EncodeToString(sha1sum[:]) {
+				t.Fatalf("hash body %v", m.hashBody)
+			}
+			if len(m.state.records()) != 0 {
+				t.Fatal("empty upload left a resume record")
+			}
+		})
 	}
 }
 
@@ -418,7 +653,8 @@ func TestUploadTimeout(t *testing.T) {
 	if time.Since(start) > 5*time.Second {
 		t.Fatal("timeout not honored")
 	}
-	if s := m.Steps(); strings.Contains(s, "hash") || strings.Contains(s, "finish") || strings.Contains(s, "put3") {
+	// Part 3 may be in flight concurrently; nothing may be committed.
+	if s := m.Steps(); strings.Contains(s, "hash") || strings.Contains(s, "commit") || strings.Contains(s, "finish") {
 		t.Fatalf("continued after timeout: %s", s)
 	}
 }
@@ -456,11 +692,6 @@ func TestUploadLocalErrors(t *testing.T) {
 	m := newUpMock(t)
 	c := newUpClient(t, m)
 	dir := t.TempDir()
-	empty := filepath.Join(dir, "e.bin")
-	os.WriteFile(empty, nil, 0o600)
-	if err := c.Upload(context.Background(), empty, "/docs"); !errors.Is(err, ErrUnsupported) {
-		t.Fatalf("empty: %v", err)
-	}
 	if err := c.Upload(context.Background(), dir, "/docs"); !errors.Is(err, ErrUnsupported) {
 		t.Fatalf("dir: %v", err)
 	}

@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"crypto/sha1"
 	"encoding"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"hash"
@@ -38,9 +40,10 @@ import (
 // no other step is retried. Failures of steps 3-5 that may have reached the
 // server are reported as ErrUnconfirmed (see unconfirmedCommit).
 //
-// Only a fresh single-file upload into an existing directory is implemented
-// (optionally reporting progress). Resume, directory creation and overwrite
-// are not; see UploadProgress.
+// UploadProgress uploads a single file into an existing directory. Non-empty
+// files keep a private local resume record (upload_resume.go); empty files
+// only use the unverified rapid-upload path and keep no record. Overwrite is
+// not supported; directory uploads are implemented in upload_tree.go.
 const (
 	uploadPrePath    = "/1/clouddrive/file/upload/pre"
 	uploadHashPath   = "/1/clouddrive/file/update/hash"
@@ -89,18 +92,19 @@ func (c *Client) Upload(ctx context.Context, localPath string, remoteDir string)
 
 // UploadProgress is Upload with an optional progress callback. If progress
 // is non-nil it is called synchronously, never concurrently, from the
-// goroutine that called UploadProgress with (0, total) once the upload
-// session is created, and then after each part has been accepted by OSS
-// with the non-decreasing cumulative byte count of accepted parts (parts
-// may complete out of order).
+// goroutine that called UploadProgress, first with the validated previously
+// accepted byte count (zero for a new upload), then after each new part has
+// been accepted by OSS and recorded locally. The cumulative byte count is
+// non-decreasing; parts may complete out of order.
 // done == total means every part is stored, not that the file is committed;
 // the upload is complete only when UploadProgress returns nil. The callback
 // must not block for long and must not call back into the Client.
 //
-// Uploads are not resumable: an interrupted upload restarts from scratch on
-// the next call. If the commit phase fails in a way that leaves the remote
-// state unknown, the error wraps ErrUnconfirmed; check the remote directory
-// before retrying.
+// Non-empty uploads are resumable on the same machine for the same absolute
+// local path, destination directory and account (see upload_resume.go);
+// resumed parts are reported as progress too. If the commit phase was
+// reached or fails in a way that leaves the remote state unknown, the error
+// wraps ErrUnconfirmed; check the remote directory before retrying.
 func (c *Client) UploadProgress(ctx context.Context, localPath string, remoteDir string, progress func(done, total int64)) error {
 	f, err := os.Open(localPath)
 	if err != nil {
@@ -114,11 +118,6 @@ func (c *Client) UploadProgress(ctx context.Context, localPath string, remoteDir
 // planned identity and resolved destination ID, avoiding a second open or
 // path-based destination resolution after their checks.
 func (c *Client) uploadOpened(ctx context.Context, f *os.File, localPath, remoteDir, dirID string, expected os.FileInfo, progress func(done, total int64)) error {
-	report := func(done, total int64) {
-		if progress != nil {
-			progress(done, total)
-		}
-	}
 	st, err := f.Stat()
 	if err != nil {
 		return fmt.Errorf("quark: upload: %w", err)
@@ -130,9 +129,6 @@ func (c *Client) uploadOpened(ctx context.Context, f *os.File, localPath, remote
 		return fmt.Errorf("%w: %s", ErrFileChanged, localPath)
 	}
 	size := st.Size()
-	if size == 0 {
-		return fmt.Errorf("%w: empty file", ErrUnsupported)
-	}
 	name := filepath.Base(localPath)
 	if name == "" || name == "." || name == string(filepath.Separator) || strings.ContainsAny(name, "/\\") {
 		return fmt.Errorf("quark: upload: invalid file name %q", name)
@@ -148,6 +144,49 @@ func (c *Client) uploadOpened(ctx context.Context, f *os.File, localPath, remote
 		}
 		dirID = dir.ID
 	}
+	mimeType := mime.TypeByExtension(filepath.Ext(name))
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+
+	if size > 0 {
+		// Resumable path; it performs its own destination conflict check
+		// after inspecting any local resume state.
+		return c.uploadResumable(ctx, f, st, localPath, dirID, name, mimeType, size, progress)
+	}
+	return c.uploadEmpty(ctx, f, st, localPath, dirID, name, mimeType, progress)
+}
+
+// uploadEmpty preserves the empty-file rapid-upload behavior, but takes the
+// same lock and checks for a previous non-empty upload before sending it.
+func (c *Client) uploadEmpty(ctx context.Context, f *os.File, st os.FileInfo, localPath, dirID, name, mimeType string, progress func(int64, int64)) (err error) {
+	abs, err := filepath.Abs(localPath)
+	if err != nil {
+		return fmt.Errorf("quark: upload: %w", err)
+	}
+	key := uploadStateKey(filepath.Clean(abs), dirID)
+	store, err := openUploadState(key)
+	if err != nil {
+		return fmt.Errorf("quark: upload: open resume state: %w", err)
+	}
+	defer func() {
+		if closeErr := store.Close(); closeErr != nil {
+			if err == nil {
+				err = fmt.Errorf("%w: upload was verified but its local lock could not be released: %v", ErrUnconfirmed, closeErr)
+			} else {
+				err = errors.Join(err, fmt.Errorf("quark: upload: release local lock: %w", closeErr))
+			}
+		}
+	}()
+	data, loadErr := store.Load()
+	if loadErr == nil {
+		clear(data)
+		return fmt.Errorf("%w: upload record %s.json already exists for %s; check it and the destination before retrying (record kept)", ErrUnconfirmed, key, name)
+	}
+	if !errors.Is(loadErr, os.ErrNotExist) {
+		return fmt.Errorf("quark: upload: load resume state: %w", loadErr)
+	}
+
 	entries, err := c.listDir(ctx, dirID)
 	if err != nil {
 		return err
@@ -158,25 +197,29 @@ func (c *Client) uploadOpened(ctx context.Context, f *os.File, localPath, remote
 		}
 	}
 
-	mimeType := mime.TypeByExtension(filepath.Ext(name))
-	if mimeType == "" {
-		mimeType = "application/octet-stream"
-	}
-
-	s, err := c.uploadPre(ctx, name, mimeType, size, dirID)
+	s, err := c.uploadPre(ctx, name, mimeType, 0, dirID)
 	if err != nil {
 		return err
 	}
-	if n := 1 + (size-1)/s.partSize; n > maxParts {
-		return fmt.Errorf("%w: %d parts exceeds %d", ErrUnsupported, n, maxParts)
+	if progress != nil {
+		progress(0, 0)
 	}
-
-	report(0, size)
-	parts, err := c.uploadParts(ctx, f, st, s, mimeType, size, progress)
-	if err != nil {
-		return err
+	// Empty file: unchanged legacy behavior, no resume record.
+	// The reference implementation hashes an empty stream and attempts
+	// rapid upload; if it isn't rapid, it also tries an empty-parts OSS
+	// completion. We deliberately omit that unverified fallback.
+	current, err := f.Stat()
+	if err != nil || !sameLocal(st, current) {
+		return fmt.Errorf("%w: empty file changed", ErrFileChanged)
 	}
+	md5sum, sha1sum := md5.Sum(nil), sha1.Sum(nil)
+	parts := &partsOutcome{md5hex: fmt.Sprintf("%x", md5sum), sha1hex: fmt.Sprintf("%x", sha1sum)}
+	return c.uploadCommit(ctx, s, parts, dirID, name, 0)
+}
 
+// uploadCommit runs update/hash, the OSS complete request (if needed) and
+// upload/finish, then verifies the destination listing.
+func (c *Client) uploadCommit(ctx context.Context, s *uploadSession, parts *partsOutcome, dirID, name string, size int64) error {
 	// Commit phase: from here on a request may change remote state.
 	if err := ctx.Err(); err != nil {
 		return err // nothing commit-related sent yet
@@ -184,6 +227,9 @@ func (c *Client) uploadOpened(ctx context.Context, f *os.File, localPath, remote
 	finished, err := c.uploadHash(ctx, s, parts.md5hex, parts.sha1hex)
 	if err != nil {
 		return unconfirmedCommit(ctx, "upload hash", err)
+	}
+	if !finished && size == 0 {
+		return fmt.Errorf("%w: server did not confirm empty-file rapid upload; check destination before retrying", ErrUnconfirmed)
 	}
 	if !finished {
 		if err := c.uploadComplete(ctx, s, parts.etags); err != nil {
@@ -529,7 +575,17 @@ func (c *Client) uploadComplete(ctx context.Context, s *uploadSession, etags []s
 		// 203 CallbackFailed: object assembled, callback outcome unknown.
 		return unconfirmedCommit(ctx, "upload commit", httpErr("upload commit", resp))
 	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxJSONBytes))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxJSONBytes+1))
+	if err != nil {
+		return unconfirmedCommit(ctx, "upload commit response", err)
+	}
+	if len(data) > maxJSONBytes {
+		return unconfirmedCommit(ctx, "upload commit response", errors.New("response too large"))
+	}
+	var root struct{ XMLName xml.Name }
+	if xml.Unmarshal(data, &root) == nil && root.XMLName.Local == "Error" {
+		return unconfirmedCommit(ctx, "upload commit response", errors.New("OSS returned an error response"))
+	}
 	return nil
 }
 

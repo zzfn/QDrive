@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -451,15 +452,7 @@ func runCommand(ctx context.Context, args []string, in io.Reader, out, errOut io
 		if info.IsDir() {
 			var progress func(string, int64, int64)
 			if !jsonMode {
-				var last time.Time
-				progress = func(name string, done, total int64) {
-					now := time.Now()
-					if done != total && !last.IsZero() && now.Sub(last) < time.Second {
-						return
-					}
-					last = now
-					fmt.Fprintf(errOut, "上传 %s: %d / %d 字节\n", displayName(name), done, total)
-				}
+				progress = newTransferProgress(errOut, "上传").report
 			}
 			err = client.UploadDir(ctx, args[1], remote, progress)
 		} else {
@@ -504,23 +497,14 @@ func runCommand(ctx context.Context, args []string, in io.Reader, out, errOut io
 		if !jsonMode {
 			progress = progressPrinter(errOut, "下载")
 		}
-		if !remote.IsDir && workersSet {
-			return nil, withCode("USAGE", errors.New("--workers 仅适用于目录下载"))
-		}
 		if remote.IsDir {
 			var dirProgress func(string, int64, int64)
 			if !jsonMode {
-				var last time.Time
-				dirProgress = func(name string, done, total int64) {
-					now := time.Now()
-					if done != total && !last.IsZero() && now.Sub(last) < time.Second {
-						return
-					}
-					last = now
-					fmt.Fprintf(errOut, "下载 %s: %d / %d 字节\n", displayName(name), done, total)
-				}
+				dirProgress = newTransferProgress(errOut, "下载").report
 			}
 			err = client.DownloadDirWorkers(ctx, remotePath, local, workers, dirProgress)
+		} else if workersSet {
+			err = client.DownloadFileWorkers(ctx, remotePath, local, workers, progress)
 		} else {
 			err = client.DownloadFileProgress(ctx, remotePath, local, progress)
 		}
@@ -538,8 +522,8 @@ func runCommand(ctx context.Context, args []string, in io.Reader, out, errOut io
 	}
 }
 
-// parseDownloadArgs accepts the same bounded directory-worker option used by
-// the reference CLI. It does not affect a single-file download.
+// parseDownloadArgs accepts a bounded worker count for directory or
+// explicitly requested single-file parallel downloads.
 func parseDownloadArgs(args []string) ([]string, int, bool, error) {
 	workers := 4
 	var positional []string
@@ -579,17 +563,194 @@ func parseDownloadArgs(args []string) ([]string, int, bool, error) {
 	return positional, workers, workersSet, nil
 }
 
-// progressPrinter reports byte counts on stderr without flooding redirected logs.
+// progressPrinter reports single-file progress on stderr without flooding logs.
 func progressPrinter(out io.Writer, label string) func(int64, int64) {
-	var last time.Time
-	return func(done, total int64) {
-		now := time.Now()
-		if done != total && !last.IsZero() && now.Sub(last) < time.Second {
-			return
-		}
-		last = now
-		fmt.Fprintf(out, "%s: %d / %d 字节\n", label, done, total)
+	p := newTransferProgress(out, label)
+	p.single = true
+	return func(done, total int64) { p.report("", done, total) }
+}
+
+const (
+	progressInterval   = time.Second
+	progressMinElapsed = 500 * time.Millisecond
+	progressMaxEntries = 256 // 同时跟踪的文件上限，防止失败/未知长度文件残留导致内存增长
+	progressMaxDone    = 64  // 最近完成的文件名，用于抑制重复的完成回调
+)
+
+// fileProgress 记录单个文件本次运行的观测状态。baseline 是首次观测（或回退后重新观测）
+// 时的已传输字节，速率只按 baseline 之后的增量计算，因此续传偏移不会抬高速率。
+type fileProgress struct {
+	baseline  int64
+	baseAt    time.Time
+	done      int64
+	updatedAt time.Time
+}
+
+// transferProgress 线程安全：目录传输的多个 worker 可并发回调。
+type transferProgress struct {
+	mu        sync.Mutex
+	out       io.Writer
+	label     string
+	single    bool
+	files     map[string]*fileProgress
+	finished  []string
+	lastPrint time.Time
+	now       func() time.Time
+}
+
+func newTransferProgress(out io.Writer, label string) *transferProgress {
+	return &transferProgress{out: out, label: label, files: make(map[string]*fileProgress), now: time.Now}
+}
+
+func (p *transferProgress) report(name string, done, total int64) {
+	if p == nil || p.out == nil {
+		return
 	}
+	if done < 0 {
+		done = 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := p.now()
+	complete := total >= 0 && done >= total
+
+	st, ok := p.files[name]
+	if !ok {
+		if complete && p.recentlyFinished(name) {
+			return // 完成后的重复回调不再打印
+		}
+		if len(p.files) >= progressMaxEntries {
+			p.evictOldest()
+		}
+		st = &fileProgress{baseline: done, baseAt: now}
+		p.files[name] = st
+	} else if done < st.done {
+		// 临时失败重试导致进度回退：重建基线，避免负速率或伪造速率。
+		st.baseline, st.baseAt = done, now
+	}
+	st.done, st.updatedAt = done, now
+
+	if complete {
+		delete(p.files, name)
+		p.markFinished(name)
+	} else if !p.lastPrint.IsZero() && now.Sub(p.lastPrint) < progressInterval {
+		return
+	}
+	p.lastPrint = now
+	fmt.Fprintln(p.out, p.format(name, st, total, now, complete))
+}
+
+func (p *transferProgress) format(name string, st *fileProgress, total int64, now time.Time, complete bool) string {
+	var b strings.Builder
+	b.WriteString(p.label)
+	if !p.single {
+		b.WriteString(" ")
+		b.WriteString(displayName(name))
+	}
+	b.WriteString(": ")
+	switch {
+	case total > 0:
+		pct := float64(st.done) / float64(total) * 100
+		if pct > 100 {
+			pct = 100
+		}
+		fmt.Fprintf(&b, "%5.1f%% %s / %s", pct, formatBytes(st.done), formatBytes(total))
+	case total == 0:
+		b.WriteString("100.0% 0 B / 0 B")
+	default:
+		fmt.Fprintf(&b, "%s / 未知大小", formatBytes(st.done))
+	}
+	elapsed := now.Sub(st.baseAt)
+	delta := st.done - st.baseline
+	speed := 0.0
+	if delta > 0 && elapsed >= progressMinElapsed {
+		speed = float64(delta) / elapsed.Seconds()
+	}
+	if speed > 0 {
+		fmt.Fprintf(&b, "  %s", formatRate(speed))
+	} else if !complete {
+		b.WriteString("  -- /s")
+	}
+	if complete {
+		b.WriteString("  已传输")
+	} else if total > 0 && speed > 0 {
+		b.WriteString("  剩余 ")
+		b.WriteString(formatETA(float64(total-st.done) / speed))
+	} else {
+		b.WriteString("  剩余 --")
+	}
+	return b.String()
+}
+
+func (p *transferProgress) evictOldest() {
+	var oldestName string
+	var oldest time.Time
+	first := true
+	for n, st := range p.files {
+		if first || st.updatedAt.Before(oldest) {
+			oldestName, oldest, first = n, st.updatedAt, false
+		}
+	}
+	if !first {
+		delete(p.files, oldestName)
+	}
+}
+
+func (p *transferProgress) markFinished(name string) {
+	if len(p.finished) >= progressMaxDone {
+		copy(p.finished, p.finished[1:])
+		p.finished = p.finished[:len(p.finished)-1]
+	}
+	p.finished = append(p.finished, name)
+}
+
+func (p *transferProgress) recentlyFinished(name string) bool {
+	for _, n := range p.finished {
+		if n == name {
+			return true
+		}
+	}
+	return false
+}
+
+func formatBytes(n int64) string {
+	if n < 0 {
+		n = 0
+	}
+	if n < 1024 {
+		return fmt.Sprintf("%d B", n)
+	}
+	return formatScaledBytes(float64(n))
+}
+
+func formatRate(bytesPerSecond float64) string {
+	if bytesPerSecond < 1024 {
+		return fmt.Sprintf("%.1f B/s", bytesPerSecond)
+	}
+	return formatScaledBytes(bytesPerSecond) + "/s"
+}
+
+func formatScaledBytes(n float64) string {
+	units := []string{"KiB", "MiB", "GiB", "TiB", "PiB", "EiB"}
+	v := n / 1024
+	i := 0
+	for v >= 1024 && i < len(units)-1 {
+		v /= 1024
+		i++
+	}
+	return fmt.Sprintf("%.1f %s", v, units[i])
+}
+
+func formatETA(sec float64) string {
+	if sec != sec || sec < 0 || sec > 99*24*3600 { // NaN、负数或过大
+		return "--"
+	}
+	s := int64(sec + 0.5)
+	h, m := s/3600, (s%3600)/60
+	if h > 0 {
+		return fmt.Sprintf("%dh%02dm%02ds", h, m, s%60)
+	}
+	return fmt.Sprintf("%dm%02ds", m, s%60)
 }
 
 func manageError(code string, err error) error {

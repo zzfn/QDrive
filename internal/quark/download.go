@@ -133,7 +133,12 @@ func (c *Client) downloadResolved(ctx context.Context, f File, remotePath string
 	if err := checkAbsent(p.target); err != nil {
 		return err
 	}
+	return c.downloadLocked(ctx, f, remotePath, p, progress)
+}
 
+// downloadLocked runs the sequential (version 1) download. The caller holds
+// the per-target lock and has validated f and the absence of the target.
+func (c *Client) downloadLocked(ctx context.Context, f File, remotePath string, p downloadPaths, progress func(done, total int64)) error {
 	want := downloadMeta{Version: metaVersion, FID: f.ID, Size: f.Size, Remote: remotePath, Target: p.target}
 	meta, offset, err := loadOrInitState(p, want)
 	if err != nil {
@@ -176,7 +181,7 @@ func (c *Client) downloadResolved(ctx context.Context, f File, remotePath string
 			return err
 		}
 	}
-	return finalize(p, f.Size, meta)
+	return finalize(p, f.Size, meta, nil)
 }
 
 func checkAbsent(name string) error {
@@ -239,6 +244,12 @@ func loadOrInitState(p downloadPaths, want downloadMeta) (downloadMeta, int64, e
 	var got downloadMeta
 	if err := json.Unmarshal(raw, &got); err != nil {
 		return want, 0, fmt.Errorf("%w: unreadable metadata %s", ErrPartialMismatch, p.meta)
+	}
+	if got.Version != metaVersion {
+		// e.g. a parallel (version 2) state with a sparse partial: its size
+		// says nothing about completeness, so never treat it as a prefix.
+		return want, 0, fmt.Errorf("%w: %s has state version %d, not resumable sequentially (retry with --workers N; data kept)",
+			ErrPartialMismatch, p.meta, got.Version)
 	}
 	if !got.sameContent(want) {
 		return want, 0, fmt.Errorf("%w: %s belongs to fid=%s size=%d, remote is fid=%s size=%d",
@@ -555,11 +566,14 @@ func appendBody(part string, offset, n int64, body io.Reader, onWrite func(held 
 
 // finalize verifies the partial size and publishes it under the target name
 // without ever replacing an existing file (hard link fails on EEXIST).
-func finalize(p downloadPaths, size int64, meta downloadMeta) error {
+func finalize(p downloadPaths, size int64, meta downloadMeta, expected os.FileInfo) error {
 	// Windows requires a writable handle for Sync (FlushFileBuffers).
 	before, err := os.Lstat(p.part)
 	if err != nil || !before.Mode().IsRegular() {
 		return fmt.Errorf("%w: partial is missing or not a regular file", ErrPartialMismatch)
+	}
+	if expected != nil && !os.SameFile(expected, before) {
+		return fmt.Errorf("%w: partial replaced after verification", ErrPartialMismatch)
 	}
 	pf, err := os.OpenFile(p.part, os.O_RDWR, 0)
 	if err != nil {
