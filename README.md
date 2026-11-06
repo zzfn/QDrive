@@ -6,7 +6,7 @@
 
 ## Linux 安装
 
-首个 GitHub Release 发布后，可以用以下命令安装最新版本，支持 Linux amd64 和 arm64：
+用以下命令安装最新版本，支持 Linux amd64 和 arm64：
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/zzfn/QDrive/main/scripts/install.sh | sh
@@ -19,11 +19,9 @@ curl -fsSL https://raw.githubusercontent.com/zzfn/QDrive/main/scripts/install.sh
 curl -fsSL https://raw.githubusercontent.com/zzfn/QDrive/main/scripts/install.sh | QDRIVE_INSTALL_DIR="$HOME/bin" sh
 ```
 
-目前尚未发布首个版本，安装命令在首个 Release 发布前无法使用。
-
 ## Windows 安装
 
-首个 GitHub Release 发布后，在 PowerShell 中运行（支持 Windows x64 和 ARM64）：
+在 PowerShell 中运行（支持 Windows x64 和 ARM64）：
 
 ```powershell
 irm https://raw.githubusercontent.com/zzfn/QDrive/main/scripts/install.ps1 | iex
@@ -38,7 +36,7 @@ irm https://raw.githubusercontent.com/zzfn/QDrive/main/scripts/install.ps1 | iex
 & "$env:USERPROFILE\.local\bin\qdrive.exe" ls /
 ```
 
-Windows 安装脚本和登录、传输流程仍需在真实设备上验证。首个 Release 发布前安装命令无法使用。
+Windows 安装脚本和登录、传输流程仍需在真实设备上验证。
 
 ## 从源码构建
 
