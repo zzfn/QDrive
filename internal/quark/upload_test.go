@@ -459,7 +459,7 @@ func TestUploadErrorsNeverFinish(t *testing.T) {
 		{"pre api error", func(m *upMock) { m.fail["pre"] = 0 }, "pre", nil},
 		{"auth error", func(m *upMock) { m.fail["auth"] = 0 }, "auth", nil},
 		{"part http error", func(m *upMock) { m.fail["put2"] = 500 }, "put2", nil},
-		{"missing etag", func(m *upMock) { m.fail["noetag"] = 1 }, "put1", nil},
+		{"missing etag", func(m *upMock) { m.fail["noetag"] = 1 }, "put", nil}, // any concurrent part may fail first
 		{"hash error", func(m *upMock) { m.fail["hash"] = 0 }, "hash", nil},
 		{"commit error", func(m *upMock) { m.fail["commit"] = 403 }, "commit", nil},
 		{"oss redirect not followed", func(m *upMock) { m.fail["put1"] = 307 }, "put1", nil},
